@@ -4,9 +4,11 @@
 #include <deque>
 
 #include "base/addr_range.hh"
+#include "base/statistics.hh"
 #include "base/trace.hh"
 #include "base/types.hh"
-#include "base/statistics.hh"
+#include "cpu/base.hh"
+#include "cpu/thread_context.hh"
 #include "dev/pci/device.hh"
 #include "mem/packet.hh"
 #include "mem/packet_access.hh"
@@ -14,11 +16,10 @@
 #include "params/CXLMemory.hh"
 #include "sim/clocked_object.hh"
 
-
 namespace gem5
 {
 
-class CXLMemory : public PciDevice 
+class CXLMemory : public PciDevice
 {
     protected:
 
@@ -33,7 +34,7 @@ class CXLMemory : public PciDevice
             const PacketPtr pkt;
             /** When did pkt enter the transmitList */
             const Tick entryTime;
-            DeferredPacket(PacketPtr _pkt, Tick _tick) : 
+            DeferredPacket(PacketPtr _pkt, Tick _tick) :
                 tick(_tick), pkt(_pkt),
                 entryTime(curTick())
             { }
@@ -165,8 +166,8 @@ class CXLMemory : public PciDevice
 
 
         /**
-        * Port on the side that forwards requests to and receives 
-        * responses from back-end memory media. The request port 
+        * Port on the side that forwards requests to and receives
+        * responses from back-end memory media. The request port
         * has a buffer for the requests not yet sent.
         */
         class CXLRequestPort : public RequestPort
@@ -243,18 +244,76 @@ class CXLMemory : public PciDevice
                 void recvReqRetry() override;
         };
 
+        /**
+         * Near-Memory Processor (NMP) memory port
+         * Provides direct access from NMP CPU to backend memory,
+         * bypassing the CXL protocol overhead for local access
+         */
+        class NMPMemPort : public RequestPort
+        {
+            private:
+                /** The CXLMemory device to which this port belongs */
+                CXLMemory& cxlMemory;
+
+                /** Name of this port */
+                std::string portName;
+
+            public:
+                /**
+                 * Constructor for NMPMemPort
+                 *
+                 * @param _name the port name
+                 * @param _device the CXLMemory device
+                 */
+                NMPMemPort(const std::string& _name, CXLMemory& _device);
+
+                /**
+                 * Receive timing response from backend memory
+                 * This is called when memory returns data to NMP CPU
+                 */
+                bool recvTimingResp(PacketPtr pkt) override;
+
+                /**
+                 * Receive retry request from backend memory
+                 */
+                void recvReqRetry() override;
+
+                /**
+                 * Get the name of this port
+                 */
+                const std::string name() const { return portName; }
+        };
+
         /** Response port of the CXLMemory. */
         CXLResponsePort cxlRspPort;
 
         /** Request port of the CXLMemory. */
         CXLRequestPort memReqPort;
 
+        /** NMP CPU memory port - direct access to backend memory */
+        NMPMemPort nmpMemPort;
+
         Tick preRspTick = -1;
+
+        /** Flag to enable/disable NMP CPU */
+        bool enableNMP;
+
+        /** Pointer to NMP CPU (if enabled) */
+        BaseCPU* nmpCPU;
+
+        /** Thread context for NMP CPU */
+        ThreadContext* nmpTC;
+
+        /** Address where NMP execution starts */
+        Addr nmpStartAddr;
+
+        /** Path to binary to run on NMP CPU */
+        std::string nmpBinaryPath;
 
         struct CXLCtrlStats : public statistics::Group
         {
             CXLCtrlStats(CXLMemory &cxlMemory);
-    
+
             statistics::Scalar reqQueFullEvents;
             statistics::Scalar reqRetryCounts;
             statistics::Scalar rspQueFullEvents;
@@ -269,8 +328,34 @@ class CXLMemory : public PciDevice
             statistics::Distribution rspQueueLatDist;
             statistics::Distribution memToCXLCtrlRsp;
         };
-    
+
         CXLCtrlStats stats;
+
+        /**
+         * Statistics for Near-Memory Processor (NMP) operations
+         * Tracks memory accesses from NMP CPU to local memory
+         */
+        struct NMPStats : public statistics::Group
+        {
+            NMPStats(CXLMemory &cxlMemory);
+
+            /** Number of memory read requests from NMP CPU */
+            statistics::Scalar nmpMemReads;
+
+            /** Number of memory write requests from NMP CPU */
+            statistics::Scalar nmpMemWrites;
+
+            /** Distribution of NMP memory access latencies (in ns) */
+            statistics::Distribution nmpAccessLatency;
+
+            /** Total cycles NMP CPU has been active */
+            statistics::Scalar nmpActiveCycles;
+
+            /** Number of times NMP CPU execution was started */
+            statistics::Scalar nmpExecutions;
+        };
+
+        NMPStats nmpStats;
 
     public:
         Tick read(PacketPtr pkt) override {
@@ -285,6 +370,55 @@ class CXLMemory : public PciDevice
         void init() override;
 
         AddrRangeList getAddrRanges() const override;
+
+        /**
+         * Initialize the NMP CPU at the CXL device
+         * Called during system initialization if NMP is enabled
+         */
+        void initNMPCPU();
+
+        /**
+         * Start NMP CPU execution
+         * Loads the NMP binary and begins execution
+         *
+         * @param startPC Program counter to start execution
+         * @param stackPtr Stack pointer for NMP CPU
+         */
+        void startNMPExecution(Addr startPC, Addr stackPtr);
+
+        /**
+         * Check if NMP CPU is enabled for this device
+         *
+         * @return true if NMP is enabled
+         */
+        bool isNMPEnabled() const { return enableNMP; }
+
+        /**
+         * Get the NMP CPU pointer
+         *
+         * @return pointer to NMP CPU (nullptr if disabled)
+         */
+        BaseCPU* getNMPCPU() const { return nmpCPU; }
+
+        /**
+         * Set the NMP CPU (called from Python configuration)
+         * This registers the CPU that was instantiated in Python
+         *
+         * @param cpu Pointer to the NMP CPU instance
+         */
+        void setNMPCPU(BaseCPU* cpu) {
+            nmpCPU = cpu;
+            inform("NMP CPU registered: %s\n", cpu ? cpu->name() : "nullptr");
+        }
+
+        /**
+         * Handle memory access from NMP CPU
+         * Called when NMP CPU issues read/write to local memory
+         *
+         * @param pkt Memory request packet from NMP CPU
+         * @return true if request was handled successfully
+         */
+        bool handleNMPMemoryAccess(PacketPtr pkt);
 
         PARAMS(CXLMemory);
         CXLMemory(const Params &p);

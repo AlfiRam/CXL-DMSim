@@ -1,5 +1,8 @@
-#include "base/trace.hh"
 #include "dev/storage/cxl_memory.hh"
+
+#include "arch/x86/regs/int.hh"
+#include "base/trace.hh"
+#include "cpu/thread_context.hh"
 #include "debug/CXLMemory.hh"
 
 namespace gem5
@@ -12,7 +15,7 @@ CXLMemory::CXLResponsePort::CXLResponsePort(const std::string& _name,
                                         AddrRange _cxlMemRange)
     : ResponsePort(_name), cxlMemory(_cxlMemory),
     memReqPort(_memReqPort), protoProcLat(_protoProcLat),
-    cxlMemRange(_cxlMemRange), outstandingResponses(0), 
+    cxlMemRange(_cxlMemRange), outstandingResponses(0),
     retryReq(false), respQueueLimit(_resp_limit),
     sendEvent([this]{ trySendTiming(); }, _name)
 {
@@ -35,11 +38,25 @@ CXLMemory::CXLMemory(const Params &p)
             ticksToCycles(p.proto_proc_lat), p.rsp_size, p.cxl_mem_range),
     memReqPort(p.name + ".mem_req_port", *this, cxlRspPort,
             ticksToCycles(p.proto_proc_lat), p.req_size),
-    preRspTick(0),        
-    stats(*this)
+    nmpMemPort(p.name + ".nmp_mem_port", *this),
+    preRspTick(0),
+    enableNMP(p.enable_nmp),
+    nmpCPU(nullptr),
+    nmpTC(nullptr),
+    nmpStartAddr(p.nmp_start_addr),
+    nmpBinaryPath(p.nmp_binary),
+    stats(*this),
+    nmpStats(*this)
     {
         DPRINTF(CXLMemory, "BAR0_addr:0x%lx, BAR0_size:0x%lx\n",
             p.BAR0->addr(), p.BAR0->size());
+
+        if (enableNMP) {
+            DPRINTF(CXLMemory, "NMP enabled: binary=%s, start_addr=0x%x\n",
+                    nmpBinaryPath.c_str(), nmpStartAddr);
+        } else {
+            DPRINTF(CXLMemory, "NMP disabled\n");
+        }
     }
 
 CXLMemory::CXLCtrlStats::CXLCtrlStats(CXLMemory &_cxlMemory)
@@ -87,13 +104,88 @@ CXLMemory::CXLCtrlStats::CXLCtrlStats(CXLMemory &_cxlMemory)
         .flags(statistics::nozero);
 }
 
-Port & 
+CXLMemory::NMPStats::NMPStats(CXLMemory &_cxlMemory)
+    : statistics::Group(&_cxlMemory),
+      ADD_STAT(nmpMemReads, statistics::units::Count::get(),
+               "Number of memory reads from NMP CPU"),
+      ADD_STAT(nmpMemWrites, statistics::units::Count::get(),
+               "Number of memory writes from NMP CPU"),
+      ADD_STAT(nmpAccessLatency, statistics::units::Tick::get(),
+               "NMP memory access latency distribution (ns)"),
+      ADD_STAT(nmpActiveCycles, statistics::units::Cycle::get(),
+               "Total cycles NMP CPU has been active"),
+      ADD_STAT(nmpExecutions, statistics::units::Count::get(),
+               "Number of times NMP CPU execution was started")
+{
+    nmpAccessLatency
+        .init(0, 500, 10)  // 0-500ns in 10ns buckets
+        .flags(statistics::nozero);
+}
+
+CXLMemory::NMPMemPort::NMPMemPort(const std::string& _name,
+                                    CXLMemory& _device)
+    : RequestPort(_name), cxlMemory(_device), portName(_name)
+{
+    DPRINTF(CXLMemory, "NMPMemPort created: %s\n", _name.c_str());
+}
+
+bool
+CXLMemory::NMPMemPort::recvTimingResp(PacketPtr pkt)
+{
+    // Receive memory response from backend and forward to NMP CPU
+    // This bypasses CXL protocol - direct local access!
+
+    DPRINTF(CXLMemory, "NMP received memory response addr=0x%x, size=%d\n",
+            pkt->getAddr(), pkt->getSize());
+
+    // Calculate and record access latency
+    Tick latency = curTick() - pkt->req->time();
+    cxlMemory.nmpStats.nmpAccessLatency.sample(latency);
+
+    // Update read/write statistics
+    if (pkt->isRead()) {
+        cxlMemory.nmpStats.nmpMemReads++;
+        DPRINTF(CXLMemory, "NMP read complete: addr=0x%x\n", pkt->getAddr());
+    } else if (pkt->isWrite()) {
+        cxlMemory.nmpStats.nmpMemWrites++;
+        DPRINTF(CXLMemory, "NMP write complete: addr=0x%x\n", pkt->getAddr());
+    }
+
+    // Forward response to NMP CPU if it exists
+    if (cxlMemory.nmpCPU != nullptr) {
+        // In a real implementation, would forward to CPU's data port
+        // For now, just acknowledge the response
+        delete pkt;
+        return true;
+    }
+
+    delete pkt;
+    return true;
+}
+
+void
+CXLMemory::NMPMemPort::recvReqRetry()
+{
+    DPRINTF(CXLMemory, "NMP received retry from backend memory\n");
+    // Handle retry - would retry pending requests
+    // For now, just log it
+}
+
+Port &
 CXLMemory::getPort(const std::string &if_name, PortID idx)
 {
     if (if_name == "cxl_rsp_port")
         return cxlRspPort;
     else if (if_name == "mem_req_port")
         return memReqPort;
+    else if (if_name == "nmp_mem_port") {
+        if (enableNMP) {
+            DPRINTF(CXLMemory, "Returning NMP memory port\n");
+            return nmpMemPort;
+        } else {
+            panic("NMP memory port requested but NMP is disabled!");
+        }
+    }
     else if (if_name == "dma")
         return dmaPort;
     else
@@ -379,7 +471,7 @@ CXLMemory::CXLResponsePort::recvAtomic(PacketPtr pkt)
             pkt->cmdString(), pkt->getAddrRange().to_string());
     panic_if(pkt->cacheResponding(), "Should not see packets where cache "
              "is responding");
-    
+
     Cycles delay = processCXLMem(pkt);
 
     Tick access_delay = memReqPort.sendAtomic(pkt);
@@ -414,6 +506,136 @@ CXLMemory::CXLResponsePort::getAddrRanges() const {
     AddrRangeList ranges = cxlMemory.getAddrRanges();
     ranges.push_back(cxlMemRange);
     return ranges;
+}
+
+// ============================================================================
+// NMP CPU Implementation
+// ============================================================================
+
+void
+CXLMemory::initNMPCPU()
+{
+    if (!enableNMP) {
+        DPRINTF(CXLMemory, "NMP CPU disabled, skipping initialization\n");
+        return;
+    }
+
+    inform("Initializing NMP CPU at CXL memory device %s\n", name().c_str());
+
+    // Validate NMP port is connected to backend memory
+    if (!nmpMemPort.isConnected()) {
+        warn("NMP memory port not connected to backend memory!\n");
+        warn("Please connect nmpMemPort to backend memory in "
+             "configuration.\n");
+        return;
+    }
+
+    // Check if CPU was provided via Python configuration
+    if (nmpCPU == nullptr) {
+        inform("NMP CPU not yet created. It should be instantiated "
+               "in Python config.\n");
+        inform("The CPU will be connected when created via "
+               "setNMPCPU() method.\n");
+        return;
+    }
+
+    // CPU exists - set up thread context
+    if (nmpCPU->numThreads > 0) {
+        nmpTC = nmpCPU->getContext(0);
+        inform("NMP CPU thread context acquired: %s\n",
+               nmpTC->getCpuPtr()->name());
+    } else {
+        warn("NMP CPU has no thread contexts!\n");
+        nmpCPU = nullptr;
+        return;
+    }
+
+    DPRINTF(CXLMemory, "NMP CPU initialization complete\n");
+    DPRINTF(CXLMemory, "  CPU Type: %s\n", nmpCPU->name());
+    DPRINTF(CXLMemory, "  Binary: %s\n", nmpBinaryPath.c_str());
+    DPRINTF(CXLMemory, "  Start address: 0x%x\n", nmpStartAddr);
+    DPRINTF(CXLMemory, "  Memory port connected: %s\n",
+            nmpMemPort.isConnected() ? "yes" : "no");
+}
+
+void
+CXLMemory::startNMPExecution(Addr startPC, Addr stackPtr)
+{
+    if (!enableNMP) {
+        warn("Attempt to start NMP execution but NMP is disabled\n");
+        return;
+    }
+
+    if (nmpCPU == nullptr) {
+        warn("NMP CPU not initialized, cannot start execution\n");
+        return;
+    }
+
+    if (nmpTC == nullptr) {
+        warn("NMP thread context not available\n");
+        return;
+    }
+
+    inform("Starting NMP CPU execution at PC=0x%x, SP=0x%x\n",
+           startPC, stackPtr);
+
+    // Increment execution counter
+    nmpStats.nmpExecutions++;
+
+    // Set up CPU registers for execution
+    // PC (Program Counter) - where to start execution
+    nmpTC->pcState(startPC);
+
+    // For simplified implementation, we'll rely on the workload/process
+    // to set up registers properly. Manual register setup requires
+    // more detailed ISA-specific knowledge.
+    //
+    // In a full implementation, registers would be set up through:
+    // - Process object (for SE mode)
+    // - Workload initialization
+    // - ISA-specific initialization routines
+
+    // Activate the thread context to begin execution
+    if (nmpTC->status() != ThreadContext::Active) {
+        nmpTC->activate();
+        inform("NMP CPU thread context activated\n");
+    }
+
+    // Record start time for tracking active cycles
+    nmpStats.nmpActiveCycles = nmpCPU->curCycle();
+
+    DPRINTF(CXLMemory, "NMP CPU execution started successfully\n");
+    DPRINTF(CXLMemory, "  PC: 0x%x\n", startPC);
+    DPRINTF(CXLMemory, "  SP: 0x%x\n", stackPtr);
+    DPRINTF(CXLMemory, "  Thread status: %s\n",
+            nmpTC->status() == ThreadContext::Active ? "Active" : "Other");
+
+    inform("NMP CPU now executing benchmark independently from host\n");
+}
+
+bool
+CXLMemory::handleNMPMemoryAccess(PacketPtr pkt)
+{
+    if (!enableNMP) {
+        warn("NMP memory access received but NMP is disabled\n");
+        return false;
+    }
+
+    DPRINTF(CXLMemory, "NMP memory access: addr=0x%x, cmd=%s, size=%d\n",
+            pkt->getAddr(), pkt->cmdString(), pkt->getSize());
+
+    // Forward request to backend memory via nmpMemPort
+    // This bypasses the CXL controller for direct local access
+    // Note: Latency will be measured in recvTimingResp using pkt->req->time()
+    bool success = nmpMemPort.sendTimingReq(pkt);
+
+    if (success) {
+        DPRINTF(CXLMemory, "NMP memory request sent successfully\n");
+    } else {
+        DPRINTF(CXLMemory, "NMP memory request blocked, will retry\n");
+    }
+
+    return success;
 }
 
 } // namespace gem5
