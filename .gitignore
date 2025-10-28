@@ -41,3 +41,13 @@ Doxygen.config
 typings
 include/cxl_benchmark/lmbench3
 /output
+
+CXL-DMSim_A_Full-System_CXL_Disaggregated_Memory_Simulator_With_Comprehensive_Silicon_Validation.pdf
+CXL-DMSim_A_Full-System_CXL_Disaggregated_Memory_Simulator_With_Comprehensive_Silicon_Validation.pdf:Zone.Identifier
+benchmarks/pointer_chase_host
+benchmarks/pointer_chase_nmp
+build.log
+comparison.txt
+fs_files/
+m5out_lmbench_cxl/
+m5out_lmbench_dram/
