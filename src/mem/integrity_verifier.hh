@@ -41,6 +41,7 @@
 #include <queue>
 
 #include "enums/IntegrityAllocationMode.hh"
+#include "enums/IntegrityRegionRole.hh"
 #include "enums/IntegrityTreeType.hh"
 #include "enums/MetadataCacheType.hh"
 #include "mem/cache/metadata_cache.hh"
@@ -76,6 +77,34 @@ class AbstractIntegrityVerifier : public ClockedObject
     ~AbstractIntegrityVerifier();
 
     void init() override;
+
+    /**
+     * Runtime writer for the held-region root state: the engine's first
+     * exported methods (cxx_exports in IntegrityVerifier.py; BaseCPU's
+     * precedent). Called from config Python between simulate() slices,
+     * while simulation is paused -- so a release-then-acquire pair
+     * across two verifiers executes with zero simulated time between
+     * the two mutations.
+     *
+     * The region is passed in (absolute physical base and size) because
+     * the runtime-transfer configuration boots with the held_region_*
+     * params absent -- there is no param state to read it from. Each
+     * call runs the runtime mirrors of the init()-time guards, derives
+     * the region's covering tree node (deriveCoveringNode), and returns
+     * it so the caller can cross-check that host and device agree on
+     * the node. Errors are fatal(): a failed transfer step mid-pause is
+     * configuration/protocol misuse, not an engine bug.
+     *
+     * releaseHeldRegion additionally refuses (fatal) while any packet
+     * with a region address is outstanding in this verifier -- the
+     * mutation-point closure of the walk-entry panic's in-flight gap.
+     * acquireHeldRegion needs no such precondition: a walk in flight at
+     * acquire time terminates successfully either way (at node 0 if it
+     * already climbed past the covering node, at the covering node
+     * otherwise).
+     */
+    uint64_t releaseHeldRegion(Addr start, Addr size);
+    uint64_t acquireHeldRegion(Addr start, Addr size);
 
   protected:
     /**
@@ -130,6 +159,20 @@ class AbstractIntegrityVerifier : public ClockedObject
     AddrRangeList integrityRanges;
 
     /**
+     * The single protected (OS-visible) region this verifier covers,
+     * cached at init().
+     *
+     * The tree's address->index math is 0-based ("addressToBlockIndex's
+     * convention"), so the walk must normalize physical addresses to
+     * offsets into this region before they enter the index math (see
+     * getProtectedOffset()). Mapping multiple disjoint protected ranges
+     * into the one contiguous index space is ambiguous and deliberately
+     * unsupported: init() fatals unless exactly one protected range is
+     * configured. Default-constructed (invalid) until init() runs.
+     */
+    AddrRange protectedOsRange;
+
+    /**
      * §6.2 range-keyed subtree handoff. handoffRangeStart/Size come from
      * params; handoffActive is (size > 0). When active, the access-address
      * range is mapped (at init()) to the contiguous MAC-leaf-index range
@@ -142,6 +185,31 @@ class AbstractIntegrityVerifier : public ClockedObject
     bool handoffActive;
     size_t handoffMacStart;
     size_t handoffMacEnd;
+
+    /**
+     * Held-region root state (node-keyed, N = 1): root identity this
+     * verifier HOLDS rather than a constant it obeys. At most one region.
+     *
+     * When heldRegionActive:
+     *   - role Acquirer: parentNodeIsSecureRoot() also terminates the walk
+     *     at heldRootNode, the single tree node whose descendants cover
+     *     exactly heldRegionRange (derived at init(), see
+     *     deriveCoveringNode()).
+     *   - role Releaser: this verifier no longer holds authority over
+     *     heldRegionRange; a walk into it panics (handlePacket()).
+     *
+     * Unlike the frozen §6.2 MAC-interval state above, these members are
+     * mutable in principle: init() populating them from params is only the
+     * FIRST writer. A future runtime transfer channel writes the same four
+     * members (active, role, range, root node) without reshaping them.
+     * Exactly one of {this, §6.2 handoff} may be active (init() fatals).
+     */
+    Addr heldRegionStart;
+    Addr heldRegionSize;
+    bool heldRegionActive;
+    enums::IntegrityRegionRole heldRegionRole;
+    AddrRange heldRegionRange;
+    size_t heldRootNode;
 
 
     /**
@@ -388,6 +456,51 @@ class AbstractIntegrityVerifier : public ClockedObject
      * otherwise ready).
      */
     std::unordered_set<RequestPtr> responseReady;
+
+    /**
+     * Convert a physical address inside the protected region to a 0-based
+     * offset into it ("addressToBlockIndex's convention").
+     *
+     * Every address that enters the tree's index math must pass through
+     * this; the raw address is only correct when the protected region is
+     * based at address zero.
+     */
+    Addr getProtectedOffset(Addr addr);
+
+    /**
+     * Derive the single tree node whose descendants cover exactly the
+     * protected-offset range [offStart, offStart + size) and nothing else.
+     *
+     * fatal()s if no exact covering node exists for the requested region:
+     * in TimingBmt only the whole protected range (node 0) and
+     * arity*page-sized, equally-aligned regions whose attachment node has
+     * no counter-bearing heap children are covered exactly.
+     *
+     * Requires init()'s protectedOsRange to be established. Kept separate
+     * from init() so a future runtime writer of the held-region state can
+     * reuse the same derivation.
+     */
+    size_t deriveCoveringNode(Addr offStart, Addr size);
+
+    /**
+     * Shared guards + derivation for the runtime writer: the runtime
+     * mirrors of the init()-time checks the writer bypasses (M2/M-C
+     * coexistence, single-region N = 1, containment in the protected
+     * region), then the covering-node derivation. `verb` names the
+     * failing operation ("release"/"acquire") in messages.
+     */
+    size_t checkAndDeriveHeldRegion(Addr start, Addr size,
+                                    const char *verb);
+
+    /**
+     * Count packets this verifier currently holds or awaits whose
+     * address lies inside `region`, by scanning packetLookup -- which
+     * spans queued requests, forwarded-awaiting-response reads, held
+     * responses mid-verification, and retry-parked packets. A superset
+     * of outstandingIntegrityVerification, which misses retry-parked
+     * packets (saveRetryVerify runs before the OIV insert).
+     */
+    unsigned regionOutstandingPackets(const AddrRange &region);
 
     /**
      * Get the parent integrity node ID associated with a packet.

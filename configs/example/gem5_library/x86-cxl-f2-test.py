@@ -143,6 +143,7 @@ from m5.objects import (
     AddrRange,
     Root,
 )
+from m5.util.convert import toMemorySize
 
 from gem5.components.boards.device_x86_board import DeviceX86Board
 from gem5.components.boards.x86_board import X86Board
@@ -151,6 +152,9 @@ from gem5.components.cachehierarchies.classic.private_l1_private_l2_cache_hierar
 )
 from gem5.components.cachehierarchies.classic.private_l1_private_l2_shared_l3_cache_hierarchy import (
     PrivateL1PrivateL2SharedL3CacheHierarchy,
+)
+from gem5.components.cachehierarchies.classic.private_l1_private_l2_shared_l3_integrity_verifier_cache_hierarchy import (
+    PrivateL1PrivateL2SharedL3IntegrityVerifierCacheHierarchy,
 )
 from gem5.components.memory.single_channel import (
     DIMM_DDR5_4400,
@@ -290,6 +294,7 @@ def serial_barrier_handler(
     host_pass: str = "host boot OK",
     device_pass: str = "device boot OK",
     checkpoint_dir: str = None,
+    transfer_trigger=None,
 ):
     """Generator that yields True iff both Systems' PASS strings have
     appeared in their serial output. The Terminal SimObject is
@@ -327,6 +332,10 @@ def serial_barrier_handler(
     restored guest read back known CXL contents.
     """
     while True:
+        # --runtime-transfer: checked BEFORE the barrier so the transfer
+        # lands even if this same activation ends the run.
+        if transfer_trigger is not None:
+            transfer_trigger()
         host_done = _serial_contains(host_serial_path, host_pass)
         dev_done = _serial_contains(device_serial_path, device_pass)
         if host_done and dev_done:
@@ -381,6 +390,8 @@ def kvm_boot_barrier_handler(
     device_readfile_path: str,
     host_phase2: str,
     device_phase2: str,
+    transfer_trigger=None,
+    dest_label: str = "ATOMIC",
 ):
     """Two-phase barrier for --kvm-boot.
 
@@ -409,13 +420,18 @@ def kvm_boot_barrier_handler(
     """
     switched = False
     while True:
+        # --runtime-transfer: the marker is emitted by the phase-2 (post-
+        # switch, ATOMIC) host script, so this fires in the second phase;
+        # checking every activation is harmless before then.
+        if transfer_trigger is not None:
+            transfer_trigger()
         if not switched:
             hb = _serial_contains(host_serial_path, boot_host)
             db = _serial_contains(device_serial_path, boot_dev)
             if hb and db:
                 print(
                     "[kvm-boot] boot barrier met — switching BOTH "
-                    "processors KVM->ATOMIC together"
+                    f"processors KVM->{dest_label} together"
                 )
                 with open(host_readfile_path, "w") as f:
                     f.write(host_phase2)
@@ -426,7 +442,7 @@ def kvm_boot_barrier_handler(
                 switched = True
                 print(
                     "[kvm-boot] switch complete; phase-2 workload "
-                    "injected via readfile — continuing under ATOMIC"
+                    f"injected via readfile — continuing under {dest_label}"
                 )
                 yield False
             else:
@@ -450,6 +466,62 @@ def kvm_boot_barrier_handler(
                     f"(host={hd}, dev={dd}) — continuing"
                 )
                 yield False
+
+
+def make_transfer_trigger(
+    marker: str,
+    host_serial_path: str,
+    host_hierarchy,
+    device_board,
+    base: int,
+    size: int,
+):
+    """One-shot runtime-transfer trigger for --runtime-transfer, shared by
+    both exit handlers (called at the top of every handler activation).
+
+    When `marker` appears in the host serial file: with simulation paused
+    (we are between m5.simulate() slices), call releaseHeldRegion on the
+    HOST verifier, then acquireHeldRegion on the DEVICE verifier — in that
+    order, in this one activation. Python is single-threaded and no event
+    runs between the two calls, so the ordered pair is atomic in simulated
+    time: the neither-holds window has zero simulated duration.
+
+    Takes the host HIERARCHY (not the verifier): the host verifier is
+    created late, inside incorporate_cache during _pre_instantiate, so it
+    does not exist when this trigger is constructed. By the time any exit
+    event fires, instantiate has completed and `.verifier` (and the
+    exported C++ methods, forwarded via the SimObject wrapper) exist. The
+    device verifier is a plain board attribute available from board
+    construction.
+    """
+    state = {"done": False}
+
+    def maybe_fire():
+        if state["done"]:
+            return
+        if not _serial_contains(host_serial_path, marker):
+            return
+        host_verifier = host_hierarchy.verifier
+        device_verifier = device_board.cxl_verifier
+        # ORDER MATTERS: release first, then acquire. Reversing this would
+        # create a dual-holder state, the exact failure mode the paused-
+        # instant pair exists to exclude.
+        host_node = host_verifier.releaseHeldRegion(base, size)
+        device_node = device_verifier.acquireHeldRegion(base, size)
+        assert host_node == device_node, (
+            f"[transfer] covering-node mismatch: host={host_node} "
+            f"device={device_node} — identical geometry should derive "
+            f"identical nodes"
+        )
+        print(
+            f"[transfer] host RELEASED then device ACQUIRED "
+            f"[{base:#x}..{base + size:#x}) at tick {m5.curTick()} — "
+            f"covering node {host_node} (host == device), zero simulated "
+            f"time between the two mutations"
+        )
+        state["done"] = True
+
+    return maybe_fire
 
 
 # =============================================================================
@@ -518,7 +590,22 @@ parser.add_argument(
     "Attempt B's TSC hazard) and releases the workload by rewriting each "
     "board's readfile (m5 readfile re-reads the file per call, "
     "pseudo_inst.cc:376). Composes with --offload/--device-integrity/"
-    "--device-handoff; the workload runs entirely under ATOMIC.",
+    "--device-handoff; the workload runs entirely under the destination "
+    "mode (--kvm-dest, default ATOMIC).",
+)
+parser.add_argument(
+    "--kvm-dest",
+    choices=["atomic", "timing"],
+    default="atomic",
+    help="Destination CPU mode for the --kvm-boot switch (default: atomic). "
+    "'timing' boots both Systems under KVM (fast), then switches BOTH "
+    "together to TIMING at the boot barrier -- the only practical way to "
+    "exercise the integrity walk (recvAtomic performs no walk), since a "
+    "cold two-System TIMING boot is impractical. One variable feeds both "
+    "processors' switch_core_type, so the two Systems cannot be given "
+    "different destinations; the barrier handler switches them in one "
+    "activation as before (a lone KVM System racing a TIMING one is the "
+    "TSC-drift hazard). Only meaningful with --kvm-boot.",
 )
 parser.add_argument(
     "--kvm-no-perf",
@@ -574,6 +661,52 @@ parser.add_argument(
     "off. Under --atomic the gate is config + receipt + ciphertext match "
     "(functional data-binding), not stats.",
 )
+parser.add_argument(
+    "--host-integrity",
+    action="store_true",
+    help="Splice an IntegrityVerifier below the HOST System's shared L3, "
+    "protecting the SAME CXL window as the device verifier: CxlOnly, "
+    "TimingBmt, identical arity and identical protected/full ranges, so both "
+    "verifiers compute identical node indices and identical metadata "
+    "addresses for the same physical byte. Host DRAM goes UNPROTECTED in "
+    "this mode (accepted modeling boundary). Adds a memmap= Reserved carve "
+    "for the integrity region to the host kernel args so the host page "
+    "allocator stays out of the metadata. Independent of --device-integrity; "
+    "combine both for the two-verifier configuration. Default off -> the "
+    "host gets the stock non-verifier hierarchy, unchanged.",
+)
+parser.add_argument(
+    "--held-region",
+    action="store_true",
+    help="Give BOTH verifiers held-region root state over the same 16 KiB "
+    "region of the protected CXL window (requires --host-integrity and "
+    "--device-integrity): the host verifier RELEASES it (any host walk into "
+    "the region panics -- denial-by-assertion) and the device verifier "
+    "ACQUIRES it (its walk terminates at the region's covering tree node "
+    "instead of node 0). The region is the LOWEST protected offset with an "
+    "exact covering node (offset 0x20000000 for the 2 GiB carve -> absolute "
+    "0x120000000). A memmap= Reserved carve keeps the host page allocator "
+    "off the released region. Static param-time population -- no runtime "
+    "transfer yet. Default off.",
+)
+parser.add_argument(
+    "--runtime-transfer",
+    action="store_true",
+    help="Runtime writer for the held-region root state (requires "
+    "--host-integrity and --device-integrity). Both verifiers boot INERT; "
+    "when the host guest emits the transfer marker over serial, the exit "
+    "handler -- with simulation paused between simulate() slices -- calls "
+    "releaseHeldRegion on the HOST verifier, then acquireHeldRegion on the "
+    "DEVICE verifier, in that order, in ONE handler activation: zero "
+    "simulated time between the two mutations. Same 16 KiB region as "
+    "--held-region (offset 0x20000000); both calls return the covering "
+    "node and the handler cross-checks they agree. Mutually exclusive "
+    "with --held-region (static population of the same state) and "
+    "--device-handoff (M2 authority on the device verifier). The region's "
+    "memmap= Reserved carve is still emitted at boot (kernel args are "
+    "fixed at boot; release happens later). Composes with the smoke/boot "
+    "flows only (default TIMING, --atomic, --kvm-boot). Default off.",
+)
 args = parser.parse_args()
 if args.take_checkpoint and args.restore:
     parser.error("--take-checkpoint and --restore are mutually exclusive.")
@@ -585,6 +718,45 @@ if args.device_handoff and not args.device_integrity:
     parser.error("--device-handoff requires --device-integrity.")
 if args.device_handoff and not args.offload:
     parser.error("--device-handoff requires --offload (it rides the mailbox).")
+if args.held_region and not (args.host_integrity and args.device_integrity):
+    parser.error(
+        "--held-region requires both --host-integrity and --device-integrity "
+        "(host releases, device acquires -- both verifiers must exist)."
+    )
+if args.held_region and args.device_handoff:
+    parser.error(
+        "--held-region and --device-handoff are mutually exclusive: both "
+        "install walk-termination authority on the device verifier, and the "
+        "verifier refuses to hold both (init() fatal)."
+    )
+if args.runtime_transfer and not (
+    args.host_integrity and args.device_integrity
+):
+    parser.error(
+        "--runtime-transfer requires both --host-integrity and "
+        "--device-integrity (host releases, device acquires -- both "
+        "verifiers must exist)."
+    )
+if args.runtime_transfer and args.held_region:
+    parser.error(
+        "--runtime-transfer and --held-region are mutually exclusive: both "
+        "populate the same held-region state (runtime writer vs static "
+        "params; the verifier also fatals on double population)."
+    )
+if args.runtime_transfer and args.device_handoff:
+    parser.error(
+        "--runtime-transfer and --device-handoff are mutually exclusive: "
+        "M2 authority on the device verifier blocks the runtime writer "
+        "(verifier fatal at the mutation point)."
+    )
+if args.runtime_transfer and (
+    args.offload or args.take_checkpoint or args.restore
+):
+    parser.error(
+        "--runtime-transfer composes only with the smoke/boot flows "
+        "(default TIMING, --atomic, --kvm-boot); not with "
+        "--offload/--take-checkpoint/--restore."
+    )
 # A checkpoint encodes its CPU class + mem_mode; ATOMIC and TIMING cannot
 # cross-restore. Fail fast rather than at opaque section-mismatch time.
 if args.atomic and (args.take_checkpoint or args.restore):
@@ -602,17 +774,23 @@ if args.dual_kvm and (
     or args.restore
     or args.device_integrity
     or args.device_handoff
+    or args.host_integrity
 ):
     parser.error(
         "--dual-kvm is a boot-only smoke test; it cannot be combined with "
         "--atomic/--offload/--take-checkpoint/--restore/--device-integrity/"
-        "--device-handoff."
+        "--device-handoff/--host-integrity."
     )
 if args.kvm_boot and args.dual_kvm:
     parser.error(
         "--kvm-boot and --dual-kvm are mutually exclusive (--dual-kvm is "
         "the boot-only experiment; --kvm-boot is the production KVM->ATOMIC "
         "flow)."
+    )
+if args.kvm_dest != "atomic" and not args.kvm_boot:
+    parser.error(
+        "--kvm-dest only selects the --kvm-boot switch destination; it "
+        "does nothing without --kvm-boot."
     )
 if args.kvm_boot and args.atomic:
     parser.error(
@@ -670,12 +848,66 @@ _cpu_type = (
     else CPUTypes.TIMING
 )
 
+# --kvm-boot switch destination (--kvm-dest). ONE variable feeds BOTH
+# boards' switch_core_type -- same never-drift idiom as --device-cores --
+# so the two Systems cannot be built with different destinations; the
+# barrier handler then switches both together in one activation, as it
+# always has (the TSC-drift hazard is a lone KVM System racing a switched
+# one, so together-ness is load-bearing).
+_kvm_switch_type = (
+    CPUTypes.TIMING if args.kvm_dest == "timing" else CPUTypes.ATOMIC
+)
+
 
 # =============================================================================
 # Host X86Board — same configuration as x86-cxl-ptr-chase-test.py so
 # the host-side regression test still passes against the same gem5 binary.
+# (Memories are constructed before the cache hierarchy because the
+# --host-integrity carve below needs the CXL window size.)
 # =============================================================================
-host_cache = PrivateL1PrivateL2SharedL3CacheHierarchy(
+host_memory = DIMM_DDR5_4400(size="3GB")
+if args.is_asic == "True":
+    host_cxl_memory = DIMM_DDR5_4400(size="8GB")
+else:
+    host_cxl_memory = SingleChannelDDR4_3200(size="8GB")
+
+# ---- CXL window geometry, single-sourced for this config ----
+# The Python-side source for the mailbox size and window base used by BOTH
+# the --offload memmap= carve (below) and the --host-integrity carve. The
+# remaining copies of these constants live in benchmarks/cxl_mailbox.h
+# (MB_BASE/MB_SIZE, guest C -- cannot import Python) and in
+# device_x86_board.py's default derivation (its "16MiB" full-range exclusion
+# and "2GiB" protected carve) -- left in place, out of this change's scope.
+# The geometry-agreement assert after device_board construction catches any
+# drift between here and the device board's internal derivation.
+_CXL_WINDOW_BASE = 0x100000000  # matches x86_board.py's cxl_mem_start
+_CXL_WINDOW_SIZE = int(host_cxl_memory.get_size())
+_CXL_MAILBOX_SIZE = toMemorySize("16MiB")  # == MB_SIZE in cxl_mailbox.h
+_CXL_MAILBOX_BASE = _CXL_WINDOW_BASE + _CXL_WINDOW_SIZE - _CXL_MAILBOX_SIZE
+_CXL_PROTECTED_SIZE = toMemorySize("2GiB")  # == device board's default carve
+
+# --held-region geometry. The region must have an EXACT covering tree node:
+# for TimingBmt at arity 4 that means a 16 KiB (arity * 4 KiB page) region,
+# 16 KiB-aligned, whose attachment node j = offset/16KiB has no
+# counter-bearing heap children (arity*j + 1 >= leaves). For the 2 GiB
+# protected carve, leaves = (2GiB/4096)/4 = 131072, so the lowest qualifying
+# offset is 32768 * 16KiB = 0x20000000 (covering node 32768). The verifier
+# re-derives and enforces all of this at init(); any other region fatals.
+_HELD_REGION_OFFSET = 0x20000000  # lowest offset with an exact covering node
+_HELD_REGION_SIZE = toMemorySize("16KiB")  # arity(4) * page(4KiB)
+_HELD_REGION_BASE = _CXL_WINDOW_BASE + _HELD_REGION_OFFSET
+
+# --runtime-transfer marker. The HOST guest emits it over serial; the exit
+# handler greps the serial file for it and performs the paused-instant
+# transfer. The guest-side echo is QUOTE-SPLIT (same discipline as
+# _kvm_marker_grep) so the script text never contains the contiguous
+# marker -- only the executed echo puts it in the serial file. Distinct
+# from every PASS/boot string the barriers key on.
+_XFER_MARKER = "F2XFER_RELEASE_GO"
+_xfer_marker_echo = "echo 'F2XFER_''RELEASE_GO'"
+
+# Both host_cache branches share the exact same cache geometry.
+_host_cache_params = dict(
     l1d_size="48kB",
     l1d_assoc=6,
     l1i_size="32kB",
@@ -686,21 +918,58 @@ host_cache = PrivateL1PrivateL2SharedL3CacheHierarchy(
     l3_assoc=48,
 )
 
-host_memory = DIMM_DDR5_4400(size="3GB")
-if args.is_asic == "True":
-    host_cxl_memory = DIMM_DDR5_4400(size="8GB")
+if args.host_integrity:
+    # Host-side verifier over the CXL window, CxlOnly. The range derivation
+    # MIRRORS DeviceX86Board's default carve (device_x86_board.py) so both
+    # verifiers hold IDENTICAL trees over IDENTICAL ranges:
+    #   full = [base, base + window - 16MiB)   (mailbox excluded from full so
+    #                                           it is neither protected nor
+    #                                           metadata -> passes through)
+    #   os   = [base, base + 2GiB)             (the protected region)
+    #   integrity = [os_end, full_end)         (carved by the verifier ctor)
+    # Same tree class/arity and metadata-cache shape as the device verifier
+    # (device_x86_board.py defaults: TimingBmt, arity 4, 128KiB/8).
+    _host_cxl_full_end = (
+        _CXL_WINDOW_BASE + _CXL_WINDOW_SIZE - _CXL_MAILBOX_SIZE
+    )
+    _host_cxl_os_end = _CXL_WINDOW_BASE + _CXL_PROTECTED_SIZE
+    assert _host_cxl_os_end < _host_cxl_full_end, (
+        "host CXL integrity os range must fit below the metadata reserve "
+        "(CXL window too small for the 2GiB carve)"
+    )
+    _host_cxl_integrity_full = [
+        AddrRange(_CXL_WINDOW_BASE, _host_cxl_full_end)
+    ]
+    _host_cxl_integrity_os = [AddrRange(_CXL_WINDOW_BASE, _host_cxl_os_end)]
+    host_cache = PrivateL1PrivateL2SharedL3IntegrityVerifierCacheHierarchy(
+        **_host_cache_params,
+        integrity_tree_type="TimingBmt",
+        integrity_tree_arity=4,
+        integrity_allocation_mode="CxlOnly",
+        cxl_integrity_full_ranges=_host_cxl_integrity_full,
+        cxl_integrity_os_ranges=_host_cxl_integrity_os,
+        # --held-region: the HOST RELEASES the region (the device acquires
+        # the same one below). Inert (size 0) unless the flag is set; the
+        # role kwarg is ignored by the verifier while size == 0.
+        held_region_start=_HELD_REGION_BASE if args.held_region else 0,
+        held_region_size=_HELD_REGION_SIZE if args.held_region else 0,
+        held_region_role="Releaser",
+        metadata_cache_size="128KiB",
+        metadata_cache_assoc=8,
+    )
 else:
-    host_cxl_memory = SingleChannelDDR4_3200(size="8GB")
+    host_cache = PrivateL1PrivateL2SharedL3CacheHierarchy(**_host_cache_params)
 
 # Host CPU: TIMING by default, ATOMIC under --atomic, KVM under --dual-kvm.
-# Under --kvm-boot: a switchable KVM->ATOMIC pair. The KVM start cores and
-# the ATOMIC switch cores share SimObject paths, and m5.switchCpus performs
+# Under --kvm-boot: a switchable KVM->(--kvm-dest) pair. The KVM start cores
+# and the switch cores share SimObject paths, and m5.switchCpus performs
 # the takeover + per-System memory-mode change itself (m5/simulate.py,
-# "Change the memory mode if required").
+# "Change the memory mode if required" -- it derives the mode from the
+# incoming cores, so ATOMIC and TIMING destinations both work unchanged).
 if args.kvm_boot:
     host_processor = SimpleSwitchableProcessor(
         starting_core_type=CPUTypes.KVM,
-        switch_core_type=CPUTypes.ATOMIC,
+        switch_core_type=_kvm_switch_type,
         isa=ISA.X86,
         num_cores=1,
     )
@@ -768,7 +1037,9 @@ device_memory = SingleChannelDDR3_1600(size="512MB")
 if args.kvm_boot:
     device_processor = SimpleSwitchableProcessor(
         starting_core_type=CPUTypes.KVM,
-        switch_core_type=CPUTypes.ATOMIC,
+        # Same _kvm_switch_type as the host processor above -- never let
+        # the two Systems' destinations drift apart.
+        switch_core_type=_kvm_switch_type,
         isa=ISA.X86,
         num_cores=args.device_cores,
     )
@@ -806,7 +1077,36 @@ device_board = DeviceX86Board(
     # Phase 3 M2: optional range-keyed subtree handoff (the board computes the
     # handed-off region at the start of cxl_os and configures the verifier).
     cxl_handoff=args.device_handoff,
+    # Held-region root state: the DEVICE ACQUIRES the region the host
+    # releases (same region, opposite roles). Inert (0/0) unless
+    # --held-region; the role kwarg is ignored while size == 0.
+    cxl_held_region_start=_HELD_REGION_BASE if args.held_region else 0,
+    cxl_held_region_size=_HELD_REGION_SIZE if args.held_region else 0,
+    cxl_held_region_role="Acquirer",
 )
+
+if args.host_integrity and args.device_integrity:
+    # Geometry-agreement guard. Identical (tree class, arity, os/full ranges)
+    # is exactly what makes the two verifiers compute identical node indices
+    # and identical metadata addresses for the same physical byte. The device
+    # board derives its ranges internally; the host mirrors that derivation
+    # above -- assert the mirror has not drifted.
+    _dev_full = device_board._cxl_integrity_full_ranges
+    _dev_os = device_board._cxl_integrity_os_ranges
+    assert (
+        len(_dev_full) == 1
+        and int(_dev_full[0].start) == int(_host_cxl_integrity_full[0].start)
+        and int(_dev_full[0].size()) == int(_host_cxl_integrity_full[0].size())
+    ), "host/device CXL integrity FULL ranges have drifted apart"
+    assert (
+        len(_dev_os) == 1
+        and int(_dev_os[0].start) == int(_host_cxl_integrity_os[0].start)
+        and int(_dev_os[0].size()) == int(_host_cxl_integrity_os[0].size())
+    ), "host/device CXL integrity OS ranges have drifted apart"
+    assert (
+        device_board._cxl_integrity_tree_type == "TimingBmt"
+        and device_board._cxl_integrity_tree_arity == 4
+    ), "host/device integrity tree class/arity have drifted apart"
 
 
 # =============================================================================
@@ -888,6 +1188,23 @@ _device_loop = (
     "m5 exit; sleep 2; "
     "done"
 )
+# --runtime-transfer (default/--atomic flows): host guest emits the
+# transfer marker after its boot PASS, then m5 exit. The Terminal is
+# unit-buffered, so the marker is in the serial file at that exit; the
+# handler runs the trigger BEFORE its barrier check, so the transfer
+# lands even if that exit is the run's last event. The --kvm-boot variant
+# instead emits the marker in the phase-2 (post-switch) script, below.
+# Nothing quiesces here beyond the boot-time memmap= carve: the host guest
+# never touches the region, so the release precondition (no outstanding
+# region packets) holds trivially.
+if args.runtime_transfer and not args.kvm_boot:
+    host_cmd = (
+        "echo '=== host: X86Board (runtime-transfer) ===';"
+        + "echo 'host boot OK';"
+        + _xfer_marker_echo
+        + ";m5 exit;"
+    )
+
 if args.take_checkpoint or args.restore:
     host_cmd = "echo 'host boot OK'; " + _liveness_loop
     device_cmd = "echo 'device boot OK'; " + _write_sentinel + _device_loop
@@ -973,10 +1290,18 @@ if args.kvm_boot:
         )
     else:
         # Plain --kvm-boot smoke: phase 2 just proves the switch landed and
-        # the guests still execute post-switch.
+        # the guests still execute post-switch. Under --runtime-transfer the
+        # phase-2 host script also emits the transfer marker (quote-split,
+        # so the script text never contains the contiguous marker): the
+        # transfer then fires post-switch, under ATOMIC -- where no walk
+        # occurs, so it proves the writer mechanics only, not the
+        # predicates.
+        _xfer_in_phase2 = (
+            f"{_xfer_marker_echo}\n" if args.runtime_transfer else ""
+        )
         _host_phase2 = (
             f"# {_KVM_PHASE2_MARKER}\n"
-            "echo 'host post-switch OK'\n" + _KVM_PHASE2_TAIL
+            "echo 'host post-switch OK'\n" + _xfer_in_phase2 + _KVM_PHASE2_TAIL
         )
         _device_phase2 = (
             f"# {_KVM_PHASE2_MARKER}\n"
@@ -991,6 +1316,7 @@ host_workload_kwargs = dict(
     readfile=os.path.join(m5.options.outdir, "host_readfile"),
     readfile_contents=host_cmd,
 )
+_host_memmap_args = []
 if args.offload:
     # Carve the top 16 MiB of the CXL window as Reserved on the HOST so
     # host_offload can mmap /dev/mem at the mailbox base (0x2ff000000) —
@@ -998,9 +1324,12 @@ if args.offload:
     # STRICT_DEVMEM blocks from /dev/mem. memmap= also keeps the host page
     # allocator out of it (no clobber). The device board is untouched: it
     # already sees the whole CXL window as Reserved. Reuses the board's own
-    # default kernel args + the carve-out. Must match MB_BASE/MB_SIZE in
-    # benchmarks/cxl_mailbox.h.
-    _host_memmap_args = ["memmap=16M$0x2ff000000"]
+    # default kernel args + the carve-out. Computed from the window
+    # constants above; must match MB_BASE/MB_SIZE in benchmarks/cxl_mailbox.h
+    # (for the 8 GiB window this is the historical "memmap=16M$0x2ff000000").
+    _host_memmap_args.append(
+        f"memmap={_CXL_MAILBOX_SIZE >> 20}M${_CXL_MAILBOX_BASE:#x}"
+    )
     if args.device_handoff:
         # Second carve: the handed-off protected region at the BOTTOM of the
         # CXL window. The host enrolls the window as type-1 RAM, so without
@@ -1014,6 +1343,35 @@ if args.offload:
             _ho_size % (1 << 20) == 0
         ), "handoff region size must be MiB-aligned for the memmap= carve"
         _host_memmap_args.append(f"memmap={_ho_size >> 20}M${_ho_base:#x}")
+if args.host_integrity:
+    # Reserve the host verifier's integrity carve so the host page allocator
+    # never touches the metadata region: a stray guest access there is a
+    # normal (non-metadata) packet inside integrityRanges and trips the
+    # verifier's processReq assert. NOT mem= — mem= would unmap the whole
+    # CXL window from the host guest. Derivation:
+    #   integrity = [os_end, full_end)
+    #             = [base + 2GiB, base + window - 16MiB)
+    #   size      = window - 2GiB - 16MiB
+    # (8 GiB window -> 6144 - 16 = 6128 MiB at 0x180000000.)
+    _intg_base = _host_cxl_os_end
+    _intg_size = _host_cxl_full_end - _host_cxl_os_end
+    assert (
+        _intg_size % (1 << 20) == 0
+    ), "integrity carve size must be MiB-aligned for the memmap= carve"
+    _host_memmap_args.append(f"memmap={_intg_size >> 20}M${_intg_base:#x}")
+if args.held_region or args.runtime_transfer:
+    # Keep the host page allocator off the held/released region: the host
+    # verifier panics -- by design -- on any walk into it once it is a
+    # Releaser, so only a deliberate access (e.g. /dev/mem at the region
+    # base, the release-invariant test) may ever reach it. Emitted at BOOT
+    # in both modes (kernel args are fixed at boot) even though under
+    # --runtime-transfer the release happens later. 16 KiB carve,
+    # K-granularity memmap= (the other carves are MiB-granularity).
+    assert _HELD_REGION_SIZE % (1 << 10) == 0
+    _host_memmap_args.append(
+        f"memmap={_HELD_REGION_SIZE >> 10}K${_HELD_REGION_BASE:#x}"
+    )
+if _host_memmap_args:
     host_workload_kwargs["kernel_args"] = (
         host_board.get_default_kernel_args() + _host_memmap_args
     )
@@ -1073,6 +1431,21 @@ elif args.kvm_boot:
 else:
     PASS_HOST, PASS_DEV = "host boot OK", "device boot OK"
 
+# --runtime-transfer trigger, shared by both handler flavors (None when
+# the flag is off). Constructed here because it needs HOST_SERIAL and the
+# board/hierarchy handles; the host verifier itself is dereferenced lazily
+# inside the trigger (it is created during _pre_instantiate).
+_transfer_trigger = None
+if args.runtime_transfer:
+    _transfer_trigger = make_transfer_trigger(
+        marker=_XFER_MARKER,
+        host_serial_path=HOST_SERIAL,
+        host_hierarchy=host_cache,
+        device_board=device_board,
+        base=_HELD_REGION_BASE,
+        size=_HELD_REGION_SIZE,
+    )
+
 if args.kvm_boot:
     # Two-phase handler: boot barrier (switch BOTH + inject phase 2) then
     # workload barrier (terminate on PASS_HOST/PASS_DEV).
@@ -1091,6 +1464,8 @@ if args.kvm_boot:
         ),
         host_phase2=_host_phase2,
         device_phase2=_device_phase2,
+        transfer_trigger=_transfer_trigger,
+        dest_label=args.kvm_dest.upper(),
     )
 else:
     _exit_handler = serial_barrier_handler(
@@ -1099,6 +1474,7 @@ else:
         host_pass=PASS_HOST,
         device_pass=PASS_DEV,
         checkpoint_dir=args.take_checkpoint,
+        transfer_trigger=_transfer_trigger,
     )
 
 simulator = TwoSystemSimulator(
@@ -1110,7 +1486,7 @@ simulator = TwoSystemSimulator(
 )
 
 _cpu_label = (
-    "KVM->ATOMIC"
+    f"KVM->{args.kvm_dest.upper()}"
     if args.kvm_boot
     else "KVM"
     if args.dual_kvm
@@ -1130,6 +1506,35 @@ print(
 print(
     f"  Device board   : DeviceX86Board  ({_cpu_label}-only)  + device_iobridge"
 )
+if args.host_integrity:
+    print(
+        f"  Host integrity : CxlOnly TimingBmt arity 4 -- protected "
+        f"[{_CXL_WINDOW_BASE:#x}..{_host_cxl_os_end:#x}), integrity "
+        f"[{_host_cxl_os_end:#x}..{_host_cxl_full_end:#x})"
+    )
+    print(
+        f"  Host intg carve: memmap="
+        f"{(_host_cxl_full_end - _host_cxl_os_end) >> 20}M"
+        f"${_host_cxl_os_end:#x} (Reserved; keeps guest off the metadata)"
+    )
+if args.held_region:
+    print(
+        f"  Held region    : [{_HELD_REGION_BASE:#x}.."
+        f"{_HELD_REGION_BASE + _HELD_REGION_SIZE:#x}) "
+        f"(offset {_HELD_REGION_OFFSET:#x}) -- host=RELEASER, "
+        f"device=ACQUIRER; covering node derived+printed at verifier init()"
+    )
+if args.runtime_transfer:
+    print(
+        f"  Runtime xfer   : on marker '{_XFER_MARKER}' in host serial -> "
+        f"host RELEASES then device ACQUIRES"
+    )
+    print(
+        f"                   [{_HELD_REGION_BASE:#x}.."
+        f"{_HELD_REGION_BASE + _HELD_REGION_SIZE:#x}) in ONE paused "
+        f"activation; watch for the '[transfer]' line and the two "
+        f"verifier inform()s"
+    )
 print(f"  cxl_mem_bus    : host_board.cxl_mem_bus  (CXLMemBar, 3 masters)")
 print(
     f"  CXL range      : 0x100000000, size {host_board.get_cxl_memory().get_size_str()}"
@@ -1157,13 +1562,16 @@ mode = (
     else "smoke-test"
 )
 if args.kvm_boot:
-    mode += " (KVM boot -> switch both -> ATOMIC workload)"
+    mode += f" (KVM boot -> switch both -> {args.kvm_dest.upper()} workload)"
 print(f"  Mode           : {mode}")
 if args.kvm_boot:
     print(f"  KVM boot       : both Systems boot under KVM (disjoint event")
     print(f"                   queues); guests park in heartbeat/poll loops.")
     print(f"                   Boot barrier ('host boot OK' AND 'device boot")
-    print(f"                   OK') -> switch BOTH to ATOMIC together ->")
+    print(
+        f"                   OK') -> switch BOTH to "
+        f"{args.kvm_dest.upper()} together ->"
+    )
     print(f"                   phase-2 workload injected via readfile.")
     print(f"                   Terminates on '{PASS_HOST}' AND '{PASS_DEV}'.")
 if args.dual_kvm:

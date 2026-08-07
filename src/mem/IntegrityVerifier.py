@@ -36,6 +36,7 @@
 from m5.objects.ClockedObject import ClockedObject
 from m5.params import *
 from m5.proxy import *  # Used for Parent.any
+from m5.util.pybind import PyBindMethod
 
 
 class MetadataCacheType(Enum):
@@ -50,11 +51,27 @@ class IntegrityTreeType(Enum):
     vals = ["TimingTree", "TimingBmt"]
 
 
+class IntegrityRegionRole(Enum):
+    vals = ["Acquirer", "Releaser"]
+
+
 class AbstractIntegrityVerifier(ClockedObject):
     type = "AbstractIntegrityVerifier"
     cxx_header = "mem/integrity_verifier.hh"
     cxx_class = "gem5::AbstractIntegrityVerifier"
     abstract = True
+
+    # Runtime writer for the held-region root state (BaseCPU's
+    # cxx_exports precedent). Called from config Python between
+    # simulate() slices, while simulation is paused, so a
+    # release-then-acquire pair across two verifiers is atomic in
+    # simulated time. Each takes (absolute base, size), derives the
+    # region's covering tree node, and returns it so the caller can
+    # cross-check that both verifiers agree. Errors are fatal.
+    cxx_exports = [
+        PyBindMethod("releaseHeldRegion"),
+        PyBindMethod("acquireHeldRegion"),
+    ]
 
     mem_side_port = RequestPort(
         "This port sends requests and receives responses"
@@ -119,6 +136,32 @@ class AbstractIntegrityVerifier(ClockedObject):
     )
     handoff_range_size = Param.Addr(
         0, "Size in bytes of the handed-off region; 0 disables handoff."
+    )
+
+    # Held-region root state (node-keyed, N = 1). When held_region_size > 0
+    # the verifier holds root state for the single region
+    # [held_region_start, held_region_start + held_region_size):
+    #   Acquirer -- its walk terminates at the region's covering TREE NODE
+    #               (derived at init()) instead of climbing to node 0.
+    #   Releaser -- it has given the region up; any walk into the region is
+    #               an engine-invariant break and panics.
+    # Unlike the §6.2 handoff above (MAC-interval-keyed), this state is keyed
+    # by tree node, and the members it populates are mutable in principle:
+    # these params are only the TEMPORARY population path until a runtime
+    # write channel exists. The two mechanisms cannot be active on one
+    # verifier at the same time (init() fatals). The region must have an
+    # EXACT covering node or init() fatals; see
+    # AbstractIntegrityVerifier::deriveCoveringNode.
+    held_region_start = Param.Addr(
+        0, "Base address (absolute physical) of the held/released region."
+    )
+    held_region_size = Param.Addr(
+        0, "Size in bytes of the held/released region; 0 disables."
+    )
+    held_region_role = Param.IntegrityRegionRole(
+        "Acquirer",
+        "Which side of the transfer this verifier is on for the held region "
+        "(ignored while held_region_size == 0).",
     )
 
 

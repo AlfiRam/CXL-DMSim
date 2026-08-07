@@ -60,9 +60,11 @@ from m5.objects import (
     IdeDisk,
     IntegrityVerifier,
     IOXBar,
+    NoncoherentXBar,
     Pc,
     Port,
     RawDiskImage,
+    SimpleMemory,
     X86E820Entry,
     X86FsLinux,
     X86IntelMPBus,
@@ -71,10 +73,6 @@ from m5.objects import (
     X86IntelMPIOIntAssignment,
     X86IntelMPProcessor,
     X86SMBiosBiosInformation,
-)
-from m5.objects import (
-    NoncoherentXBar,
-    SimpleMemory,
 )
 from m5.params import *
 from m5.proxy import *
@@ -90,7 +88,6 @@ from ..processors.abstract_processor import AbstractProcessor
 from .abstract_system_board import AbstractSystemBoard
 from .kernel_disk_workload import KernelDiskWorkload
 
-
 # Far-away placeholder address range for the device's inert CXL devices.
 # `cxlmemory.cxl_mem_range` and the dummy backing memory must agree on
 # *some* address; we put both at 16 TiB + 1 to keep them out of any real
@@ -103,8 +100,8 @@ from .kernel_disk_workload import KernelDiskWorkload
 # toMemorySize() at construction; an unrecognised prefix falls through
 # to int(value, 0) which then ValueErrors on the trailing letters.
 # Every existing PCI BAR in src/dev/ uses the {Ki,Mi,Gi}B convention.
-_INERT_CXL_BASE  = 0x100000000000  # 16 TiB
-_INERT_CXL_SIZE  = "64KiB"         # tiny — never accessed
+_INERT_CXL_BASE = 0x100000000000  # 16 TiB
+_INERT_CXL_SIZE = "64KiB"  # tiny — never accessed
 
 
 # =============================================================================
@@ -157,6 +154,18 @@ class DeviceX86Board(AbstractSystemBoard, KernelDiskWorkload):
         # re-roots its integrity walk for that range. Default OFF.
         cxl_handoff: bool = False,
         cxl_handoff_size: str = "1MiB",
+        # Held-region root state (node-keyed, N=1). When cxl_held_region_size
+        # > 0 (requires cxl_integrity), the device verifier holds root state
+        # for [cxl_held_region_start, +size): role "Acquirer" -> its walk
+        # terminates at the region's covering tree node instead of node 0;
+        # role "Releaser" -> a walk into the region panics. The verifier
+        # derives the covering node at init() and fatals if the region has
+        # no exact covering node. Default 0/0 -> inert. TEMPORARY param-time
+        # population (no runtime transfer channel yet). Mutually exclusive
+        # with cxl_handoff on the same verifier (verifier init() fatals).
+        cxl_held_region_start: int = 0,
+        cxl_held_region_size: int = 0,
+        cxl_held_region_role: str = "Acquirer",
     ) -> None:
         # Stash CXL params before super-style init so _setup_memory_ranges
         # and _setup_io_devices can see them.
@@ -168,8 +177,12 @@ class DeviceX86Board(AbstractSystemBoard, KernelDiskWorkload):
         self._cxl_integrity = cxl_integrity
         self._cxl_integrity_tree_type = cxl_integrity_tree_type
         self._cxl_integrity_tree_arity = cxl_integrity_tree_arity
-        self._cxl_integrity_metadata_cache_size = cxl_integrity_metadata_cache_size
-        self._cxl_integrity_metadata_cache_assoc = cxl_integrity_metadata_cache_assoc
+        self._cxl_integrity_metadata_cache_size = (
+            cxl_integrity_metadata_cache_size
+        )
+        self._cxl_integrity_metadata_cache_assoc = (
+            cxl_integrity_metadata_cache_assoc
+        )
         self._cxl_integrity_full_ranges = cxl_integrity_full_ranges
         self._cxl_integrity_os_ranges = cxl_integrity_os_ranges
         if cxl_integrity and cxl_mem_range is not None:
@@ -201,9 +214,9 @@ class DeviceX86Board(AbstractSystemBoard, KernelDiskWorkload):
         self._cxl_handoff_size = 0
         if cxl_handoff:
             assert cxl_integrity, "cxl_handoff requires cxl_integrity"
-            assert self._cxl_integrity_os_ranges, (
-                "cxl_handoff needs a protected cxl_os range"
-            )
+            assert (
+                self._cxl_integrity_os_ranges
+            ), "cxl_handoff needs a protected cxl_os range"
             os_base = int(self._cxl_integrity_os_ranges[0].start)
             os_size = int(self._cxl_integrity_os_ranges[0].size())
             hsize = toMemorySize(cxl_handoff_size)
@@ -212,17 +225,31 @@ class DeviceX86Board(AbstractSystemBoard, KernelDiskWorkload):
                 f"cxl_handoff_size must be {mac_gran}-byte (MAC-granularity) "
                 "aligned"
             )
-            assert hsize <= os_size, (
-                "cxl_handoff region exceeds the protected cxl_os range"
-            )
+            assert (
+                hsize <= os_size
+            ), "cxl_handoff region exceeds the protected cxl_os range"
             self._cxl_handoff_start = os_base
             self._cxl_handoff_size = hsize
+
+        # Held-region root state: stash for _setup_io_devices' verifier
+        # construction. Validation of the region itself (containment, exact
+        # covering node) is the verifier's at init().
+        self._cxl_held_region_start = cxl_held_region_start
+        self._cxl_held_region_size = cxl_held_region_size
+        self._cxl_held_region_role = cxl_held_region_role
+        if cxl_held_region_size:
+            assert cxl_integrity, "cxl_held_region_* requires cxl_integrity"
+            assert cxl_held_region_role in ("Acquirer", "Releaser"), (
+                "cxl_held_region_role must be 'Acquirer' or 'Releaser'; "
+                f"got '{cxl_held_region_role}'"
+            )
         # AbstractSystemBoard inherits from System, AbstractBoard, but
         # AbstractBoard.__init__ requires a cxl_memory and is_asic
         # parameter. We bypass AbstractSystemBoard.__init__ and call
         # AbstractBoard's grandparent (System) directly so we don't have
         # to pretend we have CXL memory on the device side.
         from m5.objects import System
+
         System.__init__(self)
 
         if processor.get_isa() != ISA.X86:
@@ -236,6 +263,7 @@ class DeviceX86Board(AbstractSystemBoard, KernelDiskWorkload):
             SrcClockDomain,
             VoltageDomain,
         )
+
         self.clk_domain = SrcClockDomain()
         self.clk_domain.clock = clk_freq
         self.clk_domain.voltage_domain = VoltageDomain()
@@ -380,8 +408,10 @@ class DeviceX86Board(AbstractSystemBoard, KernelDiskWorkload):
         )
         self.pc.south_bridge.cxlmemory.BAR0.size = _INERT_CXL_SIZE
         self.inert_cxl_bus = NoncoherentXBar(
-            frontend_latency=1, forward_latency=0,
-            response_latency=1, width=16,
+            frontend_latency=1,
+            forward_latency=0,
+            response_latency=1,
+            width=16,
         )
         self.inert_cxl_bus.cpu_side_ports = (
             self.pc.south_bridge.cxlmemory.mem_req_port
@@ -403,10 +433,7 @@ class DeviceX86Board(AbstractSystemBoard, KernelDiskWorkload):
         # claims the CXL memory range. cache_hierarchy.get_mem_side_port()
         # is the membus's mem_side_ports — a vector — so it co-exists
         # cleanly with `self.bridge`'s tap of the same port.
-        if (
-            self._cxl_mem_bus is not None
-            and self._cxl_mem_range is not None
-        ):
+        if self._cxl_mem_bus is not None and self._cxl_mem_range is not None:
             self.device_iobridge = Bridge(
                 delay="50ns",
                 ranges=[self._cxl_mem_range],
@@ -430,6 +457,19 @@ class DeviceX86Board(AbstractSystemBoard, KernelDiskWorkload):
                     handoff_range_start=self._cxl_handoff_start,
                     handoff_range_size=self._cxl_handoff_size,
                 )
+                if self._cxl_held_region_size:
+                    # Held-region root state (node-keyed): TEMPORARY
+                    # param-time population; the covering node is derived at
+                    # verifier init().
+                    self.cxl_verifier.held_region_start = (
+                        self._cxl_held_region_start
+                    )
+                    self.cxl_verifier.held_region_size = (
+                        self._cxl_held_region_size
+                    )
+                    self.cxl_verifier.held_region_role = (
+                        self._cxl_held_region_role
+                    )
                 self.cxl_metadata_cache = ClassicMetadataCache(
                     size=self._cxl_integrity_metadata_cache_size,
                     assoc=self._cxl_integrity_metadata_cache_assoc,
@@ -514,24 +554,28 @@ class DeviceX86Board(AbstractSystemBoard, KernelDiskWorkload):
         base_entries.append(pci_dev4_inta)
 
         def _assignISAInt(irq, apicPin):
-            base_entries.append(X86IntelMPIOIntAssignment(
-                interrupt_type="ExtInt",
-                polarity="ConformPolarity",
-                trigger="ConformTrigger",
-                source_bus_id=1,
-                source_bus_irq=irq,
-                dest_io_apic_id=io_apic.id,
-                dest_io_apic_intin=0,
-            ))
-            base_entries.append(X86IntelMPIOIntAssignment(
-                interrupt_type="INT",
-                polarity="ConformPolarity",
-                trigger="ConformTrigger",
-                source_bus_id=1,
-                source_bus_irq=irq,
-                dest_io_apic_id=io_apic.id,
-                dest_io_apic_intin=apicPin,
-            ))
+            base_entries.append(
+                X86IntelMPIOIntAssignment(
+                    interrupt_type="ExtInt",
+                    polarity="ConformPolarity",
+                    trigger="ConformTrigger",
+                    source_bus_id=1,
+                    source_bus_irq=irq,
+                    dest_io_apic_id=io_apic.id,
+                    dest_io_apic_intin=0,
+                )
+            )
+            base_entries.append(
+                X86IntelMPIOIntAssignment(
+                    interrupt_type="INT",
+                    polarity="ConformPolarity",
+                    trigger="ConformTrigger",
+                    source_bus_id=1,
+                    source_bus_irq=irq,
+                    dest_io_apic_id=io_apic.id,
+                    dest_io_apic_intin=apicPin,
+                )
+            )
 
         _assignISAInt(0, 2)
         _assignISAInt(1, 1)

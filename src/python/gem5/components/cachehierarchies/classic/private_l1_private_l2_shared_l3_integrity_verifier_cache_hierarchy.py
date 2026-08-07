@@ -69,6 +69,11 @@ class PrivateL1PrivateL2SharedL3IntegrityVerifierCacheHierarchy(
         integrity_tree_arity: int = 4,
         integrity_allocation_mode: str = "DramOnly",
         integrity_reserve_size: str = "1GiB",
+        cxl_integrity_full_ranges: "list | None" = None,
+        cxl_integrity_os_ranges: "list | None" = None,
+        held_region_start: int = 0,
+        held_region_size: int = 0,
+        held_region_role: str = "Acquirer",
         metadata_cache_size: str = "128KiB",
         metadata_cache_assoc: int = 8,
     ) -> None:
@@ -76,14 +81,54 @@ class PrivateL1PrivateL2SharedL3IntegrityVerifierCacheHierarchy(
         :param integrity_tree_type: "TimingBmt" (default, the BMT variant the
             real work targets) or "TimingTree".
         :param integrity_tree_arity: Tree arity (default 4).
-        :param integrity_allocation_mode: "DramOnly" for host-to-host.
-        :param integrity_reserve_size: Bytes carved off the TOP of host DRAM to
-            hold the integrity structure. dram_os_ranges = [0, full - reserve);
+        :param integrity_allocation_mode: "DramOnly" (default, host-to-host)
+            or "CxlOnly" (host-side verifier over the CXL window; host DRAM
+            goes UNPROTECTED -- an accepted modeling boundary).
+        :param integrity_reserve_size: DramOnly ONLY. Bytes carved off the TOP
+            of host DRAM to hold the integrity structure.
+            dram_os_ranges = [0, full - reserve);
             dram_full_ranges = [0, full). MUST be large enough to hold the tree
             for the OS-visible data or the verifier init() fatals
             (treeSizeValid). See the config for the sizing rationale.
+            Ignored under CxlOnly (the caller-supplied ranges carry the carve).
+        :param cxl_integrity_full_ranges / os_ranges: CxlOnly ONLY. The
+            caller-computed CXL range lists handed verbatim to the verifier
+            (same kwargs and semantics as DeviceX86Board's
+            cxl_integrity_full_ranges / cxl_integrity_os_ranges). The caller
+            owns the derivation (window base/size, mailbox exclusion) so that
+            a host and a device verifier can be given IDENTICAL ranges.
+        :param held_region_start / size / role: held-region root state
+            (node-keyed, N=1), TEMPORARY param-time population. size 0
+            (default) = inert. role "Acquirer" (walk terminates at the
+            region's covering tree node) or "Releaser" (a walk into the
+            region panics). The verifier derives the covering node at init()
+            and fatals if the region has no exact covering node.
         :param metadata_cache_size / assoc: the on-chip metadata cache.
         """
+        # The two modes are mutually exclusive by construction: the verifier's
+        # init() fatals unless it holds EXACTLY ONE protected OS range, so the
+        # DRAM carve must be SUPPRESSED (not supplemented) under CxlOnly.
+        if integrity_allocation_mode == "CxlOnly":
+            assert cxl_integrity_full_ranges and cxl_integrity_os_ranges, (
+                "CxlOnly requires explicit cxl_integrity_full_ranges and "
+                "cxl_integrity_os_ranges"
+            )
+        else:
+            assert integrity_allocation_mode == "DramOnly", (
+                "integrity_allocation_mode must be 'DramOnly' or 'CxlOnly'; "
+                f"got '{integrity_allocation_mode}'"
+            )
+            assert (
+                cxl_integrity_full_ranges is None
+                and cxl_integrity_os_ranges is None
+            ), "cxl_integrity_*_ranges are only meaningful under CxlOnly"
+
+        if held_region_size:
+            assert held_region_role in ("Acquirer", "Releaser"), (
+                "held_region_role must be 'Acquirer' or 'Releaser'; "
+                f"got '{held_region_role}'"
+            )
+
         # Fresh membus per instance (avoid the base class's shared default).
         super().__init__(
             l1d_size=l1d_size,
@@ -100,6 +145,11 @@ class PrivateL1PrivateL2SharedL3IntegrityVerifierCacheHierarchy(
         self._integrity_tree_arity = integrity_tree_arity
         self._integrity_allocation_mode = integrity_allocation_mode
         self._integrity_reserve_size = integrity_reserve_size
+        self._cxl_integrity_full_ranges = cxl_integrity_full_ranges
+        self._cxl_integrity_os_ranges = cxl_integrity_os_ranges
+        self._held_region_start = held_region_start
+        self._held_region_size = held_region_size
+        self._held_region_role = held_region_role
         self._metadata_cache_size = metadata_cache_size
         self._metadata_cache_assoc = metadata_cache_assoc
 
@@ -181,6 +231,14 @@ class PrivateL1PrivateL2SharedL3IntegrityVerifierCacheHierarchy(
         self.verifier.cpu_side_port = self.l3cache.mem_side
         self.membus.cpu_side_ports = self.verifier.mem_side_port
 
+        if self._held_region_size:
+            # Held-region root state (node-keyed, N=1): TEMPORARY param-time
+            # population. The verifier derives the region's covering tree
+            # node at init() and fatals if no exact covering node exists.
+            self.verifier.held_region_start = self._held_region_start
+            self.verifier.held_region_size = self._held_region_size
+            self.verifier.held_region_role = self._held_region_role
+
         # Metadata cache hangs off the verifier's metadata ports only.
         self.metadata_cache = ClassicMetadataCache(
             size=self._metadata_cache_size,
@@ -189,17 +247,31 @@ class PrivateL1PrivateL2SharedL3IntegrityVerifierCacheHierarchy(
         self.metadata_cache.cpu_side = self.verifier.metadata_req_port
         self.verifier.metadata_resp_port = self.metadata_cache.mem_side
 
-        # ---- DRAM range carve-out ----
-        # OS-visible range MUST be strictly smaller than the full range, with
-        # the top `reserve` bytes left for the integrity structure; otherwise
-        # the verifier init() fatals via hasValidRanges()/treeSizeValid().
-        # X86Board lays host DRAM out as a single contiguous range [0, size).
-        full_size = board.get_memory().get_size()
-        reserve = toMemorySize(self._integrity_reserve_size)
-        os_size = full_size - reserve
-        assert os_size > 0, (
-            "integrity_reserve_size (%d) >= total DRAM (%d)"
-            % (reserve, full_size)
-        )
-        self.verifier.dram_full_ranges = [AddrRange(full_size)]
-        self.verifier.dram_os_ranges = [AddrRange(os_size)]
+        if self._integrity_allocation_mode == "CxlOnly":
+            # ---- CXL-only carve (host verifier over the CXL window) ----
+            # Assign ONLY the cxl_* range params; the dram_* params stay at
+            # their empty defaults. Assigning both would hand the verifier two
+            # protected OS ranges and trip its single-protected-range fatal at
+            # init(). Host DRAM traffic then passes through the splice
+            # unverified (needsVerification is false outside the ranges) --
+            # the accepted modeling boundary for this mode.
+            self.verifier.cxl_full_ranges = self._cxl_integrity_full_ranges
+            self.verifier.cxl_os_ranges = self._cxl_integrity_os_ranges
+        else:
+            # ---- DRAM range carve-out (unchanged default behavior) ----
+            # OS-visible range MUST be strictly smaller than the full range,
+            # with the top `reserve` bytes left for the integrity structure;
+            # otherwise the verifier init() fatals via
+            # hasValidRanges()/treeSizeValid().
+            # X86Board lays host DRAM out as a single contiguous [0, size).
+            full_size = board.get_memory().get_size()
+            reserve = toMemorySize(self._integrity_reserve_size)
+            os_size = full_size - reserve
+            assert (
+                os_size > 0
+            ), "integrity_reserve_size (%d) >= total DRAM (%d)" % (
+                reserve,
+                full_size,
+            )
+            self.verifier.dram_full_ranges = [AddrRange(full_size)]
+            self.verifier.dram_os_ranges = [AddrRange(os_size)]

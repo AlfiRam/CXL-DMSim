@@ -46,6 +46,7 @@
 #include "debug/IntegrityNodeLocationMap.hh"
 #include "mem/mtree/timing_bmt.hh"
 #include "mem/mtree/timing_tree.hh"
+#include "mem/mtree/util.hh"
 
 namespace gem5
 {
@@ -84,6 +85,18 @@ AbstractIntegrityVerifier::AbstractIntegrityVerifier(
     handoffActive = (p.handoff_range_size > 0);
     handoffMacStart = 0;
     handoffMacEnd = 0;
+
+    // Held-region root state (node-keyed, N=1). The covering node is derived
+    // later in init(), once the protected range is established. Populating
+    // from params is the TEMPORARY first writer (same shape as the §6.2
+    // handoff above); the members themselves stay mutable so a future runtime
+    // transfer channel can write them without reshaping the state.
+    heldRegionStart = p.held_region_start;
+    heldRegionSize = p.held_region_size;
+    heldRegionActive = (p.held_region_size > 0);
+    heldRegionRole = p.held_region_role;
+    heldRootNode = 0;
+    // heldRegionRange stays default-constructed (invalid) until init().
 
     // Compute integrity memory ranges.
     auto dramOsRangeIt = dramOsRanges.begin();
@@ -226,14 +239,44 @@ AbstractIntegrityVerifier::init()
               rangeListSize(cxlIntegrityRanges));
     }
 
-    // §6.2 range-keyed subtree handoff: map the handed-off ADDRESS range to the
-    // contiguous MAC-leaf-INDEX range the walk short-circuits on. We re-express
-    // "data address in handoff region" as "MAC node index in handoff MAC range"
-    // because the original data address is not available once the walk climbs
-    // on metadata-node packets (the MAC index, available via getMetadataNode(),
-    // is a monotonic/linear image of the address via addressToBlockIndex, so a
-    // contiguous address range maps to a contiguous MAC-index range — and this
-    // is topology-independent, unlike tree node ids).
+    // The tree's address->index math is 0-based ("addressToBlockIndex's
+    // convention"): the walk normalizes physical addresses to offsets from
+    // a single protected-region base (see getProtectedOffset). Mapping
+    // multiple disjoint protected ranges into the one contiguous index
+    // space is ambiguous and deliberately unsupported.
+    {
+        AddrRangeList protectedRanges;
+        for (const auto &range : dramOsRanges) {
+            protectedRanges.emplace_back(range);
+        }
+        for (const auto &range : cxlOsRanges) {
+            protectedRanges.emplace_back(range);
+        }
+
+        if (protectedRanges.size() != 1) {
+            fatal("The integrity verifier requires exactly one protected "
+                  "(OS-visible) range to normalize walk addresses against; "
+                  "got %d: %s\n",
+                  protectedRanges.size(),
+                  rangeListToString(protectedRanges));
+        }
+
+        protectedOsRange = protectedRanges.front();
+
+        DPRINTF(AbstractIntegrityVerifierInit,
+            "%s: protectedOsRange: %s\n",
+            __func__, protectedOsRange.to_string());
+    }
+
+    // §6.2 range-keyed subtree handoff: map the handed-off ADDRESS range to
+    // the contiguous MAC-leaf-INDEX range the walk short-circuits on. We
+    // re-express "data address in handoff region" as "MAC node index in
+    // handoff MAC range" because the original data address is not available
+    // once the walk climbs on metadata-node packets (the MAC index, available
+    // via getMetadataNode(), is a monotonic/linear image of the address via
+    // addressToBlockIndex, so a contiguous address range maps to a contiguous
+    // MAC-index range — and this is topology-independent, unlike tree node
+    // ids).
     if (handoffActive) {
         // Base + size of the protected OS region this verifier covers.
         const Addr osBase = !cxlOsRanges.empty()
@@ -274,11 +317,54 @@ AbstractIntegrityVerifier::init()
         }
 
         inform("IntegrityVerifier %s: range-keyed handoff ACTIVE: region "
-               "[0x%x, 0x%x) (offset [0x%x, 0x%x)) -> MAC nodes [%llu, %llu).\n",
+               "[0x%x, 0x%x) (offset [0x%x, 0x%x)) -> MAC nodes "
+               "[%llu, %llu).\n",
                name(), handoffRangeStart, handoffRangeStart + handoffRangeSize,
                offStart, offEnd,
                (unsigned long long)handoffMacStart,
                (unsigned long long)handoffMacEnd);
+    }
+
+    // Held-region root state (node-keyed, N=1): populate from params. This
+    // block is the TEMPORARY first writer of the four held-region members;
+    // a future runtime transfer channel replaces it, not the members.
+    if (heldRegionActive) {
+        // Two walk-termination authorities on one verifier would leave the
+        // predicate without a precedence rule; exactly one may be active.
+        if (handoffActive) {
+            fatal("The §6.2 MAC-interval handoff and the held-region root "
+                  "state cannot both be active on one verifier.\n");
+        }
+
+        // The region must lie within the (single) protected OS region.
+        const Addr protBase = protectedOsRange.start();
+        const Addr protSize = protectedOsRange.size();
+        if (heldRegionStart < protBase ||
+            heldRegionStart + heldRegionSize > protBase + protSize) {
+            fatal("Held region [0x%x, 0x%x) is not within the protected OS "
+                  "region %s.\n",
+                  heldRegionStart, heldRegionStart + heldRegionSize,
+                  protectedOsRange.to_string());
+        }
+
+        heldRegionRange = AddrRange(heldRegionStart,
+                                    heldRegionStart + heldRegionSize);
+
+        // Normalize to a 0-based protected offset ("addressToBlockIndex's
+        // convention") and derive the region's single exact covering tree
+        // node; fatals if none exists.
+        const Addr offStart = heldRegionStart - protBase;
+        heldRootNode = deriveCoveringNode(offStart, heldRegionSize);
+
+        inform("IntegrityVerifier %s: held-region root state ACTIVE as %s: "
+               "region %s (offset [0x%x, 0x%x)) -> covering tree node "
+               "%llu.\n",
+               name(),
+               heldRegionRole == enums::IntegrityRegionRole::Acquirer
+                   ? "ACQUIRER" : "RELEASER",
+               heldRegionRange.to_string(),
+               offStart, offStart + heldRegionSize,
+               (unsigned long long)heldRootNode);
     }
 }
 
@@ -657,6 +743,230 @@ AbstractIntegrityVerifier::processMetadataResp(PacketPtr pkt)
 
 
 
+Addr
+AbstractIntegrityVerifier::getProtectedOffset(Addr addr)
+{
+    // init() established that exactly one protected range exists and
+    // cached it; a default-constructed (invalid) range here means this
+    // was called before init().
+    assert(protectedOsRange.valid());
+    // Only addresses inside the protected region have a defined offset.
+    assert(protectedOsRange.contains(addr));
+
+    return addr - protectedOsRange.start();
+}
+
+size_t
+AbstractIntegrityVerifier::deriveCoveringNode(Addr offStart, Addr size)
+{
+    // init() established the protected range before any derivation.
+    assert(protectedOsRange.valid());
+    assert(size > 0);
+    assert(offStart + size <= protectedOsRange.size());
+
+    // The whole protected range is covered exactly by the global root.
+    if (offStart == 0 && size == protectedOsRange.size()) {
+        return 0;
+    }
+
+    // The exact-covering condition below is TimingBmt's geometry (counters
+    // attach to the overlapped heap top). TimingTree lays out a real leaf
+    // level instead; refuse rather than mis-root.
+    if (integrityTreeType != enums::IntegrityTreeType::TimingBmt) {
+        fatal("Held-region covering-node derivation is only implemented for "
+              "the TimingBmt integrity tree.\n");
+    }
+
+    // NOTE: Sync with timing_bmt.cc. One counter node covers one 4096-byte
+    // page (PAGE_SIZE_BYTES); tree node j directly attaches the `arity`
+    // counters {arity*j .. arity*j + arity-1}, i.e. covers arity*4096 bytes
+    // of data; and j's heap children carry counters of their own unless
+    // arity*j + 1 >= leaves, where
+    //     counterNodes = ceilDiv(protected_size, 4096)
+    //     leaves       = ceilDiv(counterNodes, arity).
+    // Therefore a proper (non-root) region has an EXACT covering node iff
+    //     size == arity*4096,
+    //     offStart % (arity*4096) == 0, and
+    //     arity*j + 1 >= leaves       for j = offStart / (arity*4096).
+    const unsigned int arity = integrityTree->statTreeArity();
+    const Addr pageSize = 4096;
+    const Addr gran = (Addr)arity * pageSize;
+    const long long counterNodes =
+        ceilDiv((long long)protectedOsRange.size(), (long long)pageSize);
+    const long long leaves = ceilDiv(counterNodes, (long long)arity);
+
+    if (size != gran) {
+        fatal("Held region size 0x%x has no exact covering tree node: in "
+              "TimingBmt (arity %u) only %u-byte (arity*page) regions -- or "
+              "the whole protected range -- are covered exactly by a single "
+              "node.\n",
+              size, arity, (unsigned)gran);
+    }
+    if ((offStart % gran) != 0) {
+        fatal("Held region offset 0x%x is not %u-byte aligned; its pages "
+              "would span two attachment nodes, so no exact covering node "
+              "exists.\n",
+              offStart, (unsigned)gran);
+    }
+
+    const size_t j = offStart / gran;
+    if ((long long)(arity * j + 1) < leaves) {
+        fatal("Held region at offset 0x%x has no exact covering tree node: "
+              "attachment node %llu still has counter-bearing heap children "
+              "(arity*j + 1 = %llu < leaves = %llu), so its descendants "
+              "cover more than the region. Exact covering nodes exist only "
+              "for offsets >= 0x%llx in this configuration.\n",
+              offStart, (unsigned long long)j,
+              (unsigned long long)(arity * j + 1),
+              (unsigned long long)leaves,
+              (unsigned long long)(ceilDiv(leaves - 1, (long long)arity) *
+                                   gran));
+    }
+
+    // Cross-check the NOTE-synced formula against the tree's own hop
+    // arithmetic (data -> MAC -> counter -> tree node) so drift is caught
+    // here at init() instead of silently mis-rooting. Disagreement is an
+    // engine bug, not a config error.
+    const size_t nodeFirst = integrityTree->parentBlockIndex(
+        integrityTree->parentBlockIndex(
+            integrityTree->addressToBlockIndex(offStart)));
+    const size_t nodeLast = integrityTree->parentBlockIndex(
+        integrityTree->parentBlockIndex(
+            integrityTree->addressToBlockIndex(offStart + size - 1)));
+    panic_if(nodeFirst != j || nodeLast != j,
+             "Covering-node formula (%llu) disagrees with the tree's hop "
+             "arithmetic (first %llu, last %llu); deriveCoveringNode is out "
+             "of sync with timing_bmt.cc.\n",
+             (unsigned long long)j, (unsigned long long)nodeFirst,
+             (unsigned long long)nodeLast);
+    assert(integrityTree->getNodeType(j) ==
+           AbstractIntegrityTree::TreeNodeType::TreeNode);
+    // Edge exclusivity: the neighbouring granule on each side (when one
+    // exists) must attach to a different node, or j would cover more than
+    // the region.
+    assert(offStart == 0 ||
+           integrityTree->parentBlockIndex(integrityTree->parentBlockIndex(
+               integrityTree->addressToBlockIndex(offStart - 1))) != j);
+    assert(offStart + size == protectedOsRange.size() ||
+           integrityTree->parentBlockIndex(integrityTree->parentBlockIndex(
+               integrityTree->addressToBlockIndex(offStart + size))) != j);
+
+    return j;
+}
+
+size_t
+AbstractIntegrityVerifier::checkAndDeriveHeldRegion(
+    Addr start, Addr size, const char *verb)
+{
+    // Runtime mirrors of the init()-time guards: the param path runs these
+    // at elaboration; the runtime writer bypasses init() and must re-check
+    // them at the mutation point.
+    if (handoffActive) {
+        fatal("IntegrityVerifier %s: cannot %s held region: the §6.2 "
+              "MAC-interval handoff is active on this verifier, and the two "
+              "walk-termination authorities cannot coexist.\n",
+              name(), verb);
+    }
+    if (heldRegionActive) {
+        fatal("IntegrityVerifier %s: cannot %s held region: this verifier "
+              "already holds region %s as %s (N = 1: one region, no "
+              "re-transfer).\n",
+              name(), verb, heldRegionRange.to_string(),
+              heldRegionRole == enums::IntegrityRegionRole::Acquirer
+                  ? "ACQUIRER" : "RELEASER");
+    }
+    if (size == 0) {
+        fatal("IntegrityVerifier %s: cannot %s a zero-sized region.\n",
+              name(), verb);
+    }
+
+    // Containment in the (single) protected OS region -- mirror of the
+    // init() check. Exported methods run between simulate() slices, so
+    // init() has run and protectedOsRange is established.
+    assert(protectedOsRange.valid());
+    const Addr protBase = protectedOsRange.start();
+    const Addr protSize = protectedOsRange.size();
+    if (start < protBase || start + size > protBase + protSize) {
+        fatal("IntegrityVerifier %s: cannot %s region [0x%x, 0x%x): not "
+              "within the protected OS region %s.\n",
+              name(), verb, start, start + size,
+              protectedOsRange.to_string());
+    }
+
+    // Geometry (exact covering node or refuse) is enforced by the
+    // derivation's own fatals, exactly as on the param path.
+    return deriveCoveringNode(start - protBase, size);
+}
+
+unsigned
+AbstractIntegrityVerifier::regionOutstandingPackets(const AddrRange &region)
+{
+    unsigned count = 0;
+    for (const auto &it : packetLookup) {
+        if (region.contains(it.second->getAddr())) {
+            count++;
+            DPRINTF(AbstractIntegrityVerifier,
+                "%s: outstanding region packet: %s (pkt %p)\n",
+                __func__, it.second->print(), it.second);
+        }
+    }
+    return count;
+}
+
+uint64_t
+AbstractIntegrityVerifier::releaseHeldRegion(Addr start, Addr size)
+{
+    const size_t node = checkAndDeriveHeldRegion(start, size, "release");
+    const AddrRange region(start, start + size);
+
+    // The walk-entry panic guards only walk ENTRY: a region packet already
+    // past handlePacket (hash/XOR/metadata in flight) or parked in a retry
+    // event would complete and be served AFTER the release. That gap is
+    // closed HERE, at the mutation point: refuse to become Releaser while
+    // any packet with a region address is outstanding in this verifier.
+    const unsigned pending = regionOutstandingPackets(region);
+    if (pending > 0) {
+        fatal("IntegrityVerifier %s: cannot release region %s: %u packet(s) "
+              "with region addresses are still outstanding in this verifier; "
+              "quiesce the region before releasing.\n",
+              name(), region.to_string(), pending);
+    }
+
+    heldRegionRange = region;
+    heldRootNode = node;
+    heldRegionRole = enums::IntegrityRegionRole::Releaser;
+    // Written last: the predicate and the walk-entry panic key on it.
+    heldRegionActive = true;
+
+    inform("IntegrityVerifier %s: runtime transfer: RELEASED region %s "
+           "(covering node %llu); walks into it now panic.\n",
+           name(), heldRegionRange.to_string(), (unsigned long long)node);
+
+    return node;
+}
+
+uint64_t
+AbstractIntegrityVerifier::acquireHeldRegion(Addr start, Addr size)
+{
+    const size_t node = checkAndDeriveHeldRegion(start, size, "acquire");
+
+    // No outstanding-work precondition here: a region walk in flight at
+    // acquire time terminates successfully either way (at node 0 if it
+    // already climbed past the covering node, at the covering node
+    // otherwise) -- both terminators are success.
+    heldRegionRange = AddrRange(start, start + size);
+    heldRootNode = node;
+    heldRegionRole = enums::IntegrityRegionRole::Acquirer;
+    // Written last: the predicate keys on it.
+    heldRegionActive = true;
+
+    inform("IntegrityVerifier %s: runtime transfer: ACQUIRED region %s "
+           "(covering node %llu); the walk now terminates there.\n",
+           name(), heldRegionRange.to_string(), (unsigned long long)node);
+
+    return node;
+}
+
 size_t
 AbstractIntegrityVerifier::getParentNode(PacketPtr pkt)
 {
@@ -667,7 +977,12 @@ AbstractIntegrityVerifier::getParentNode(PacketPtr pkt)
 
         return integrityTree->parentBlockIndex(pkt->getMetadataNode());
     } else {
-        return integrityTree->addressToBlockIndex(pkt->getAddr());
+        // Normalize to a 0-based offset into the protected region
+        // ("addressToBlockIndex's convention") before entering the index
+        // math. The raw address is only correct when the protected region
+        // is based at address zero.
+        return integrityTree->addressToBlockIndex(
+            getProtectedOffset(pkt->getAddr()));
     }
 }
 
@@ -681,6 +996,15 @@ AbstractIntegrityVerifier::parentNodeIsSecureRoot(PacketPtr pkt)
     const size_t node = pkt->getMetadataNode();
     // The global root (node 0) is always trusted/on-chip.
     if (node == 0) {
+        return true;
+    }
+    // Held-region root (node-keyed): the ACQUIRER of a held region
+    // terminates its walk at the region's covering tree node -- the root it
+    // holds -- instead of climbing to the global root. (Mutually exclusive
+    // with the §6.2 clause below; init() enforces it.)
+    if (heldRegionActive &&
+        heldRegionRole == enums::IntegrityRegionRole::Acquirer &&
+        node == heldRootNode) {
         return true;
     }
     // §6.2 range-keyed re-root: a MAC leaf of the handed-off region is treated
@@ -849,6 +1173,32 @@ AbstractIntegrityVerifier::handlePacket(PacketPtr pkt)
     DPRINTF(AbstractIntegrityVerifier,
             "%s: Handling verification of packet %s\n",
             __func__, pkt->print());
+
+    // RELEASE side of a held-region transfer: this verifier has given the
+    // region up, so no walk may enter it. Keeping traffic off the region is
+    // external (serve-set: kernel memmap= carve); a packet reaching the walk
+    // anyway is an engine-invariant break. Denial-by-assertion: checked
+    // before any walk state (hash, OIV, metadata request) is committed.
+    if (heldRegionActive &&
+        heldRegionRole == enums::IntegrityRegionRole::Releaser) {
+        if (!pkt->isMetadataRequest() &&
+            heldRegionRange.contains(pkt->getAddr())) {
+            panic("Walk into released region: %s (addr 0x%x) is inside "
+                  "released region %s (covering node %llu); this verifier "
+                  "no longer holds authority there.\n",
+                  pkt->print(), pkt->getAddr(),
+                  heldRegionRange.to_string(),
+                  (unsigned long long)heldRootNode);
+        }
+        // The released subtree's metadata is only requested by walks out of
+        // the region, which the check above kills first -- unreachable, and
+        // kept to document the boundary in node space.
+        panic_if(pkt->isMetadataRequest() &&
+                 pkt->getMetadataNode() == heldRootNode,
+                 "Walk reached released covering node %llu (region %s).\n",
+                 (unsigned long long)heldRootNode,
+                 heldRegionRange.to_string());
+    }
 
     // TODO May need to adjust this
     if (outstandingIntegrityVerification.size() > maxEncQueueSize) {

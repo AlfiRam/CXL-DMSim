@@ -69,6 +69,7 @@ SimObject('MemDelay.py', sim_objects=['MemDelay', 'SimpleMemDelay'])
 SimObject('IntegrityVerifier.py', sim_objects=[
     'AbstractIntegrityVerifier', 'IntegrityVerifier'],
     enums=['IntegrityAllocationMode',
+           'IntegrityRegionRole',
            'IntegrityTreeType',
            'MetadataCacheType',
     ]
