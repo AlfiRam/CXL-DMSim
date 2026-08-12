@@ -769,89 +769,151 @@ AbstractIntegrityVerifier::deriveCoveringNode(Addr offStart, Addr size)
         return 0;
     }
 
-    // The exact-covering condition below is TimingBmt's geometry (counters
-    // attach to the overlapped heap top). TimingTree lays out a real leaf
-    // level instead; refuse rather than mis-root.
+    // The exact-covering condition below is TimingBmt's geometry.
+    // TimingTree has no counters or MACs at all; refuse rather than
+    // mis-root.
     if (integrityTreeType != enums::IntegrityTreeType::TimingBmt) {
         fatal("Held-region covering-node derivation is only implemented for "
               "the TimingBmt integrity tree.\n");
     }
 
-    // NOTE: Sync with timing_bmt.cc. One counter node covers one 4096-byte
-    // page (PAGE_SIZE_BYTES); tree node j directly attaches the `arity`
-    // counters {arity*j .. arity*j + arity-1}, i.e. covers arity*4096 bytes
-    // of data; and j's heap children carry counters of their own unless
-    // arity*j + 1 >= leaves, where
+    // NOTE: Sync with timing_bmt.cc. Counters attach at the LEAF LAYER
+    // (parentBlockIndex's Counter case: treeNodes - leaves + counter/arity),
+    // so the tree is an ordinary arity-ary heap and coverage is contiguous:
+    //     one counter node        covers 1 page                (4096 B)
+    //     one leaf                covers arity counters        (gran bytes)
+    //     a node `levels` above
+    //     the leaf layer          covers arity^levels leaves
+    // with, mirroring timing_bmt.cc's constructor,
     //     counterNodes = ceilDiv(protected_size, 4096)
-    //     leaves       = ceilDiv(counterNodes, arity).
+    //     leaves       = ceilDiv(counterNodes, arity)
+    //     height       = integerLog(leaves, arity) + 1
+    //     firstLeaf    = layerBase(height - 1)
+    // where layerBase(m) = (arity^m - 1)/(arity - 1) is the number of nodes
+    // above layer m -- i.e. the first index OF layer m -- and equals the
+    // constructor's `non_leaf_nodes` for m = height-1 (timing_bmt.cc uses
+    // integerPower(arity, height-1)/(arity-1), the same value).
+    //
     // Therefore a proper (non-root) region has an EXACT covering node iff
-    //     size == arity*4096,
-    //     offStart % (arity*4096) == 0, and
-    //     arity*j + 1 >= leaves       for j = offStart / (arity*4096).
+    //     size    == gran * arity^levels   for some levels >= 0, and
+    //     offStart % size == 0             (alignment equals size),
+    // and then, hand-checkably, the covering node is simply the m-th node
+    // of the layer that many levels above the leaves:
+    //     coveringNode = layerBase(height - 1 - levels) + offStart / size.
+    //
+    // Raggedness note: the leaf layer is allocated with `leaves` entries
+    // against a full-layer capacity of arity^(height-1) (50% populated in
+    // the 2 GiB/arity-4 configuration), but a region that is CONTAINED in
+    // the protected range and aligned can never reach an unallocated leaf:
+    // offStart + size <= protected_size divides through by gran to give
+    // leafIdx + arity^levels <= leaves. The containment assert above is
+    // what closes that; the assert below states the invariant explicitly.
     const unsigned int arity = integrityTree->statTreeArity();
     const Addr pageSize = 4096;
     const Addr gran = (Addr)arity * pageSize;
     const long long counterNodes =
         ceilDiv((long long)protectedOsRange.size(), (long long)pageSize);
     const long long leaves = ceilDiv(counterNodes, (long long)arity);
+    const unsigned int height =
+        (unsigned int)integerLog(leaves, arity) + 1;
+    // The locally-recomputed geometry must match the tree's own.
+    assert(height == integrityTree->statTreeHeight());
 
-    if (size != gran) {
-        fatal("Held region size 0x%x has no exact covering tree node: in "
-              "TimingBmt (arity %u) only %u-byte (arity*page) regions -- or "
-              "the whole protected range -- are covered exactly by a single "
-              "node.\n",
-              size, arity, (unsigned)gran);
+    // layerBase(m): first node index of heap layer m (nodes above it).
+    auto layerBase = [arity](unsigned int m) -> size_t {
+        return (size_t)((integerPower(arity, m) - 1) / (arity - 1));
+    };
+
+    // The admissible sizes, for the messages below: gran * arity^k while
+    // it still fits the protected range, plus the smallest admissible size
+    // at or above what was asked for.
+    Addr maxAdmissible = gran;
+    while (maxAdmissible * arity <= protectedOsRange.size()) {
+        maxAdmissible *= arity;
     }
-    if ((offStart % gran) != 0) {
-        fatal("Held region offset 0x%x is not %u-byte aligned; its pages "
-              "would span two attachment nodes, so no exact covering node "
-              "exists.\n",
-              offStart, (unsigned)gran);
+    Addr nearest = gran;
+    while (nearest < size && nearest < maxAdmissible) {
+        nearest *= arity;
     }
 
-    const size_t j = offStart / gran;
-    if ((long long)(arity * j + 1) < leaves) {
-        fatal("Held region at offset 0x%x has no exact covering tree node: "
-              "attachment node %llu still has counter-bearing heap children "
-              "(arity*j + 1 = %llu < leaves = %llu), so its descendants "
-              "cover more than the region. Exact covering nodes exist only "
-              "for offsets >= 0x%llx in this configuration.\n",
-              offStart, (unsigned long long)j,
-              (unsigned long long)(arity * j + 1),
-              (unsigned long long)leaves,
-              (unsigned long long)(ceilDiv(leaves - 1, (long long)arity) *
-                                   gran));
+    // size must be gran * arity^levels; `levels` counts how far above the
+    // leaf layer the covering node sits.
+    unsigned int levels = 0;
+    Addr granules = size / gran;
+    if (size < gran || (size % gran) != 0) {
+        granules = 0;   // not even a whole number of leaves
     }
+    while (granules > 1 && (granules % arity) == 0) {
+        granules /= arity;
+        levels++;
+    }
+    if (granules != 1) {
+        fatal("Held region size 0x%x has no exact covering tree node: an "
+              "exactly-covered region must be arity^k * %u bytes (arity "
+              "%u, page %u) -- 0x%x, 0x%x, 0x%x, ... up to 0x%x -- or the "
+              "whole protected range, and must be aligned to its own "
+              "size. Nearest admissible size at or above the request: "
+              "0x%x.\n",
+              size, (unsigned)gran, arity, (unsigned)pageSize,
+              (unsigned)gran, (unsigned)(gran * arity),
+              (unsigned)(gran * arity * arity),
+              (unsigned long long)maxAdmissible,
+              (unsigned long long)nearest);
+    }
+    if (levels > height - 1) {
+        fatal("Held region size 0x%x needs a covering node %u levels above "
+              "the leaf layer, but the tree is only %u levels tall.\n",
+              size, levels, height);
+    }
+    if ((offStart % size) != 0) {
+        fatal("Held region offset 0x%x is not aligned to its own size "
+              "0x%x; an exactly-covered region must be aligned to its "
+              "size, or its leaves would span two covering nodes. Nearest "
+              "aligned offsets: 0x%x and 0x%x.\n",
+              offStart, size,
+              (unsigned long long)(offStart - (offStart % size)),
+              (unsigned long long)(offStart - (offStart % size) + size));
+    }
+
+    // The closed form: the m-th node of layer (height-1-levels).
+    const size_t node = layerBase(height - 1 - levels) + (offStart / size);
+
+    // Step-0 invariant, stated rather than assumed: every leaf under the
+    // covering node is an ALLOCATED leaf (see the raggedness note above).
+    assert((long long)(offStart / gran) + integerPower(arity, levels) <=
+           leaves);
 
     // Cross-check the NOTE-synced formula against the tree's own hop
-    // arithmetic (data -> MAC -> counter -> tree node) so drift is caught
-    // here at init() instead of silently mis-rooting. Disagreement is an
-    // engine bug, not a config error.
-    const size_t nodeFirst = integrityTree->parentBlockIndex(
-        integrityTree->parentBlockIndex(
-            integrityTree->addressToBlockIndex(offStart)));
-    const size_t nodeLast = integrityTree->parentBlockIndex(
-        integrityTree->parentBlockIndex(
-            integrityTree->addressToBlockIndex(offStart + size - 1)));
-    panic_if(nodeFirst != j || nodeLast != j,
+    // arithmetic (data -> MAC -> counter -> leaf, then `levels` heap
+    // steps) so drift is caught here at init() instead of silently
+    // mis-rooting. Disagreement is an engine bug, not a config error.
+    auto coveringByHops = [this, levels](Addr off) -> size_t {
+        size_t n = integrityTree->parentBlockIndex(
+            integrityTree->parentBlockIndex(
+                integrityTree->addressToBlockIndex(off)));
+        for (unsigned int l = 0; l < levels; l++) {
+            n = integrityTree->parentBlockIndex(n);
+        }
+        return n;
+    };
+    const size_t nodeFirst = coveringByHops(offStart);
+    const size_t nodeLast = coveringByHops(offStart + size - 1);
+    panic_if(nodeFirst != node || nodeLast != node,
              "Covering-node formula (%llu) disagrees with the tree's hop "
              "arithmetic (first %llu, last %llu); deriveCoveringNode is out "
              "of sync with timing_bmt.cc.\n",
-             (unsigned long long)j, (unsigned long long)nodeFirst,
+             (unsigned long long)node, (unsigned long long)nodeFirst,
              (unsigned long long)nodeLast);
-    assert(integrityTree->getNodeType(j) ==
+    assert(integrityTree->getNodeType(node) ==
            AbstractIntegrityTree::TreeNodeType::TreeNode);
     // Edge exclusivity: the neighbouring granule on each side (when one
-    // exists) must attach to a different node, or j would cover more than
-    // the region.
-    assert(offStart == 0 ||
-           integrityTree->parentBlockIndex(integrityTree->parentBlockIndex(
-               integrityTree->addressToBlockIndex(offStart - 1))) != j);
+    // exists) must climb to a different node, or `node` would cover more
+    // than the region.
+    assert(offStart == 0 || coveringByHops(offStart - 1) != node);
     assert(offStart + size == protectedOsRange.size() ||
-           integrityTree->parentBlockIndex(integrityTree->parentBlockIndex(
-               integrityTree->addressToBlockIndex(offStart + size))) != j);
+           coveringByHops(offStart + size) != node);
 
-    return j;
+    return node;
 }
 
 size_t

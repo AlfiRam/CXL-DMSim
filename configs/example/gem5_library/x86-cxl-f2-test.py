@@ -683,11 +683,36 @@ parser.add_argument(
     "--device-integrity): the host verifier RELEASES it (any host walk into "
     "the region panics -- denial-by-assertion) and the device verifier "
     "ACQUIRES it (its walk terminates at the region's covering tree node "
-    "instead of node 0). The region is the LOWEST protected offset with an "
-    "exact covering node (offset 0x20000000 for the 2 GiB carve -> absolute "
-    "0x120000000). A memmap= Reserved carve keeps the host page allocator "
+    "instead of node 0). The region defaults to 16 KiB at protected offset "
+    "0x20000000 (absolute 0x120000000) and is settable with "
+    "--held-region-offset/--held-region-size -- any size-aligned "
+    "16 KiB/64 KiB/.../1 GiB region qualifies. "
+    "A memmap= Reserved carve keeps the host page allocator "
     "off the released region. Static param-time population -- no runtime "
     "transfer yet. Default off.",
+)
+parser.add_argument(
+    "--held-region-offset",
+    type=lambda s: int(s, 0),
+    default=0x20000000,
+    metavar="OFF",
+    help="Protected-range offset of the held region (default 0x20000000, "
+    "today's value). Must be aligned to --held-region-size; the verifier "
+    "derives the covering tree node at init() and fatals with the "
+    "admissible-shape list if the region has none. Set this together with "
+    "--held-region-size to make the handed-off region BE the region a "
+    "--graph-walk device arm then walks (offset 0x40000000, size 64MiB).",
+)
+parser.add_argument(
+    "--held-region-size",
+    type=str,
+    default="16KiB",
+    metavar="SIZE",
+    help="Size of the held region (default 16KiB, today's value). Must be "
+    "one of the arity^k admissible shapes -- 16KiB, 64KiB, 256KiB, 1MiB, "
+    "4MiB, 16MiB, 64MiB, 256MiB, 1GiB for arity 4 over the 2 GiB carve -- "
+    "and the offset must be aligned to it. 64MiB is the smallest shape "
+    "that contains the default graph CSR.",
 )
 parser.add_argument(
     "--runtime-transfer",
@@ -706,6 +731,206 @@ parser.add_argument(
     "memmap= Reserved carve is still emitted at boot (kernel args are "
     "fixed at boot; release happens later). Composes with the smoke/boot "
     "flows only (default TIMING, --atomic, --kvm-boot). Default off.",
+)
+parser.add_argument(
+    "--read-block",
+    action="store_true",
+    help="Splice a ReadBlockGate on each CXL DRAM channel (between "
+    "cxl_mem_bus and the MemCtrl): a host TIMING read of the mailbox "
+    "STATUS slot is HELD, unanswered, until a store to that slot arrives "
+    "(the device's STATUS_BUSY/STATUS_DONE writes), then completed with "
+    "the stored value -- read-blocking completion, no polling. The gate "
+    "is value-blind; the BUSY release is intended (the guest loop's next "
+    "load is simply held again). Stores are FORWARDED as well as "
+    "observed, so DRAM stays authoritative. Requires a timing workload "
+    "phase: refuses --atomic, --dual-kvm, --kvm-boot with atomic "
+    "destination, and checkpointing (a held load blocks the drain). "
+    "Default off -> the bus-to-MemCtrl wiring is byte-identical.",
+)
+parser.add_argument(
+    "--poll-us",
+    type=int,
+    default=1000,
+    metavar="US",
+    help="Host offload poll period in simulated microseconds, threaded "
+    "into the guest as the MB_POLL_US environment variable "
+    "(host_offload.c reads it at startup; compiled-in default 1000). "
+    "0 = busy-spin (no usleep at all). Exists so the polling baseline "
+    "can be swept rather than asserted. Only meaningful with --offload.",
+)
+parser.add_argument(
+    "--timeout-s",
+    type=int,
+    default=200,
+    metavar="S",
+    help="Poll budget in SIMULATED seconds, threaded to every guest "
+    "poller as MB_TIMEOUT_S (host_offload, device_offload, "
+    "graph_walk_host). The budget is time-equivalent, so changing "
+    "--poll-us does not change how long a poller waits. ONE knob for "
+    "all three: the historical budgets were asymmetric by inheritance "
+    "(graph_walk_host 200 s, the two offload guests 100 s) and this "
+    "default preserves the LARGER one, so no run that used to succeed "
+    "can now time out. NOTE this does not order the two waits: the "
+    "device's doorbell wait starts before the host reaches the "
+    "doorbell, so a slow host build can still exhaust the device "
+    "first -- both then print TIMEOUT and the run ends diagnosably.",
+)
+parser.add_argument(
+    "--cache-probe",
+    action="store_true",
+    help="Run the /dev/mem cacheability probe (benchmarks/cache_probe.c) "
+    "instead of a workload: the host kernel gets a dedicated Reserved "
+    "carve (memmap=32M$0x140000000) and the host guest runs cache_probe "
+    "against it, measuring whether an O_SYNC and a no-O_SYNC mapping of "
+    "the carve are cacheable. The run terminates on the probe's "
+    "completion echo whether the probe passes, fails, or errors. "
+    "Measures the PLAIN path: mutually exclusive with the offload/"
+    "integrity/handoff/held-region/runtime-transfer/read-block/"
+    "checkpoint machinery. Composes with the default TIMING flow and "
+    "with --kvm-boot (use --kvm-dest timing for a timing-fidelity "
+    "verdict). Grep the host serial for 'CACHE PROBE'. Default off.",
+)
+parser.add_argument(
+    "--graph-walk",
+    choices=["host", "device"],
+    default=None,
+    help="Run the CXL graph-walk comparison workload instead of a "
+    "smoke test. 'host' (config 1): the host CPU runs the random walk "
+    "over a CSR graph resident in a CACHEABLE CXL carve, missing to "
+    "CXL from its own hierarchy. 'device' (config 2): the host builds "
+    "the same graph, flushes it, and ships the walk to the device NMP "
+    "via OP_WALK (in-place pointer blob); the bracket includes dispatch "
+    "and completion detection. Both modes walk the IDENTICAL sequence "
+    "(shared seed/steps via gw_header) and must print identical "
+    "checksums. m5_reset_stats/m5_dump_stats bracket the work; compare "
+    "simTicks of the bracketed dump between the two runs. NO integrity "
+    "verifier in either mode. Requires a TIMING workload phase. Grep "
+    "host serial for 'GRAPH WALK'. Default off.",
+)
+parser.add_argument(
+    "--graph-nodes",
+    type=int,
+    default=65536,
+    metavar="N",
+    help="Graph node count for --graph-walk (default 65536 -- a small "
+    "smoke size whose CSR fits in the host L3; scale up to exceed it).",
+)
+parser.add_argument(
+    "--graph-degree",
+    type=int,
+    default=8,
+    metavar="D",
+    help="Fixed out-degree for --graph-walk (default 8). CSR bytes = "
+    "4*((N+1) + N*D) plus a header page.",
+)
+parser.add_argument(
+    "--graph-steps",
+    type=int,
+    default=1000000,
+    metavar="S",
+    help="Walk length for --graph-walk (default 1e6). Two dependent "
+    "loads per step.",
+)
+parser.add_argument(
+    "--graph-transfer",
+    action="store_true",
+    help="Runtime authority migration DRIVEN BY the graph-walk guest "
+    "(requires --graph-walk device, --host-integrity, --device-integrity). "
+    "Both verifiers boot INERT; graph_walk_host.c builds and flushes the "
+    "CSR, quiesces the region, prints the transfer marker and calls "
+    "m5_exit, and the exit handler -- simulation paused -- calls "
+    "releaseHeldRegion on the HOST verifier then acquireHeldRegion on the "
+    "DEVICE verifier. Only then does the host ring the doorbell, so the "
+    "device walks a region whose authority it already holds and its walks "
+    "terminate at the region's covering node instead of node 0. The "
+    "release lands OUTSIDE the measurement bracket (before "
+    "m5_reset_stats), so both arms bracket identical work. Uses the "
+    "--held-region-offset/--held-region-size geometry: pass 0x40000000 "
+    "and 64MiB to make the handed-off region the region the graph "
+    "occupies. DISTINCT from --runtime-transfer, which owns host_cmd "
+    "itself and therefore remains incompatible with --graph-walk. "
+    "Default off.",
+)
+parser.add_argument(
+    "--dispatch-block",
+    action="store_true",
+    help="Mirror of --read-block, on the device's side of the "
+    "handshake: hold the DEVICE's doorbell poll read of the mailbox "
+    "command word until the HOST's store to that same word arrives, "
+    "then complete it from the store's payload. The device blocks on "
+    "one load instead of waking every poll period, so its pickup "
+    "becomes exact instead of quantised (expected saving: half the "
+    "poll period, ~500 us at the 1000 us default, against a ~160 ns "
+    "link round trip). Implemented as a SECOND INSTANCE of the same "
+    "gate chained per channel, so the two holds cannot interfere. "
+    "THIS IS NOT DISPATCH IN HARDWARE: the device still issues the "
+    "load it blocks on; what moves into hardware is the timing of the "
+    "release, not the decision to start. Requires a TIMING workload "
+    "phase. Default off.",
+)
+parser.add_argument(
+    "--observe-cxl",
+    action="store_true",
+    help="Splice a passive CxlTrafficObserver at S1 (between the CXL "
+    "controller's memory-side port and cxl_mem_bus), where ALL host "
+    "traffic to CXL DRAM passes undivided by channel. It forwards every "
+    "packet verbatim in every mode, acts on none, and adds no latency; "
+    "under TIMING it classifies each request into stats: write-backs by "
+    "command (WritebackDirty/Clean, WriteClean), CleanEvict counted "
+    "SEPARATELY because it carries no payload and is not a write, "
+    "demand vs prefetch, verifier metadata traffic by tag rather than "
+    "by address, and reads. It also reports distinct-line coverage over "
+    "the observed range. IT HOLDS NO COUNTER and derives none: the "
+    "integrity engine stores no node values, so a derived counter would "
+    "have nowhere to live and nothing to check against. This supports a "
+    "claim about OBSERVABILITY and COST only. Observed range = the "
+    "protected CXL OS carve. Requires a TIMING workload phase (under "
+    "KVM no packet is produced at all). Default off.",
+)
+parser.add_argument(
+    "--graph-transfer-quiesce-us",
+    type=int,
+    default=2000,
+    metavar="US",
+    help="Simulated microseconds graph_walk_host.c sleeps after the "
+    "flush, before emitting the --graph-transfer marker (default 2000). "
+    "Best-effort quiesce: releaseHeldRegion fatals if ANY packet with a "
+    "region address is still outstanding in the host verifier, and three "
+    "host prefetchers feed that seam. With no demand stream during the "
+    "sleep no new prefetches are generated and outstanding ones retire, "
+    "but nothing guarantees emptiness -- raise this if the release "
+    "fatals with 'packet(s) with region addresses are still outstanding'.",
+)
+parser.add_argument(
+    "--cxl-latency",
+    type=int,
+    default=None,
+    metavar="NS",
+    help="Modeled HOST-side CXL crossing cost in ns, ONE-WAY (applied "
+    "symmetrically per direction, so a load round-trip pays 2x). Maps "
+    "onto the host path's three fixed components: the two protocol-"
+    "processing latencies stay at their model values (CXLBridge "
+    "proto_proc_lat 12ns + CXLMemory proto_proc_lat 15ns ASIC / 60ns "
+    "FPGA) and the remainder goes to CXLBridge bridge_lat (the link-"
+    "flight term). Default (flag absent): parameters untouched -- "
+    "today's 50+12+15 = 77ns one-way. The DEVICE's path (its 50ns "
+    "device_iobridge) is deliberately NOT touched: the device sits on "
+    "the far side of the link and this knob models the host's crossing "
+    "only. The banner prints the mapping in effect.",
+)
+parser.add_argument(
+    "--host-like-device",
+    action="store_true",
+    help="ABLATION flag, not a new default: give the HOST the device's "
+    "core and cache configuration -- same hierarchy class "
+    "(PrivateL1PrivateL2, i.e. NO L3 at all), same L1I/L1D/L2 sizes "
+    "and associativities, same 1.5GHz clock -- read from the device's "
+    "own single-sourced configuration so the two cannot drift. Its "
+    "purpose is to isolate what memory PLACEMENT alone buys in the "
+    "graph-walk comparison, by removing the core and cache asymmetry. "
+    "The device is never changed. Off by default; with it off the "
+    "host is exactly as today. Incompatible with --host-integrity "
+    "(which requires the SharedL3 verifier hierarchy).",
 )
 args = parser.parse_args()
 if args.take_checkpoint and args.restore:
@@ -775,12 +1000,214 @@ if args.dual_kvm and (
     or args.device_integrity
     or args.device_handoff
     or args.host_integrity
+    or args.read_block
+    or args.cache_probe
 ):
     parser.error(
         "--dual-kvm is a boot-only smoke test; it cannot be combined with "
         "--atomic/--offload/--take-checkpoint/--restore/--device-integrity/"
-        "--device-handoff/--host-integrity."
+        "--device-handoff/--host-integrity/--read-block/--cache-probe."
     )
+# --read-block interlocks. A held read cannot exist outside timing mode
+# (the gate's recvAtomic must return synchronously; it fatals at init
+# under plain atomic), and a load held across a drain point hangs the
+# run (TimingSimpleCPU refuses to drain with an access outstanding), so
+# checkpointing is out until the gate is quiesce-aware.
+if args.read_block and args.atomic:
+    parser.error(
+        "--read-block cannot be combined with --atomic: a held read "
+        "cannot exist outside timing mode (the gate would fatal at "
+        "init anyway)."
+    )
+if args.read_block and args.kvm_boot and args.kvm_dest != "timing":
+    parser.error(
+        "--read-block with --kvm-boot requires --kvm-dest timing: the "
+        "workload phase must run under TIMING for a read to be held; "
+        "an ATOMIC workload would silently measure nothing."
+    )
+if args.read_block and (args.take_checkpoint or args.restore):
+    parser.error(
+        "--read-block cannot be combined with --take-checkpoint/"
+        "--restore: a held load blocks the pre-checkpoint drain, and "
+        "the gate carries no serialization."
+    )
+if args.poll_us < 0:
+    parser.error("--poll-us must be >= 0 (0 = busy-spin).")
+# --cache-probe interlocks: the probe replaces the host workload, so it
+# cannot combine with anything that hardwires host_cmd (--offload,
+# checkpointing, --runtime-transfer); and it exists to measure the PLAIN
+# host->CXL path, so the verifier/handoff/held/read-block machinery must
+# not be instantiated in the same run.
+if args.cache_probe and args.offload:
+    parser.error(
+        "--cache-probe and --offload are mutually exclusive: both "
+        "hardwire the host command."
+    )
+if args.cache_probe and (args.take_checkpoint or args.restore):
+    parser.error(
+        "--cache-probe cannot be combined with --take-checkpoint/"
+        "--restore: both replace the host command and park loops."
+    )
+if args.cache_probe and args.runtime_transfer:
+    parser.error(
+        "--cache-probe and --runtime-transfer are mutually exclusive: "
+        "both rewrite the host command."
+    )
+if args.cache_probe and (
+    args.host_integrity
+    or args.device_integrity
+    or args.device_handoff
+    or args.held_region
+    or args.read_block
+):
+    parser.error(
+        "--cache-probe measures the plain host->CXL path; it cannot be "
+        "combined with --host-integrity/--device-integrity/"
+        "--device-handoff/--held-region/--read-block."
+    )
+# --graph-walk interlocks: it replaces the host command and measures the
+# PLAIN path (no verifier in either config -- that is a later step), and
+# a TIMING workload phase is required for the measurement to mean
+# anything.
+if args.graph_walk and (
+    args.offload
+    or args.cache_probe
+    or args.take_checkpoint
+    or args.restore
+    or args.runtime_transfer
+):
+    parser.error(
+        "--graph-walk cannot be combined with --offload/--cache-probe/"
+        "--take-checkpoint/--restore/--runtime-transfer: they rewrite "
+        "the host command."
+    )
+# --graph-walk now COMPOSES with --host-integrity, --device-integrity,
+# --held-region, and --read-block: the first mechanism+measurement
+# combined runs. The graph carve lies inside the verifiers' protected
+# range, so with integrity on, every graph access is verified traffic
+# (the walk's first exercise under a workload). Only the M2 handoff
+# stays fenced, and DELIBERATELY so -- not as a leftover: it is
+# static, param-time, device-side-only, with no release side, and it
+# must not be reachable from a measurement flow until it is chosen
+# explicitly.
+if args.graph_walk and args.device_handoff:
+    parser.error(
+        "--graph-walk with --device-handoff is excluded ON PURPOSE, "
+        "not as a leftover: the static M2 authority mechanism stays "
+        "unreachable from measurement flows until chosen explicitly."
+    )
+if args.graph_walk and args.atomic:
+    parser.error(
+        "--graph-walk requires a TIMING workload phase; --atomic would "
+        "measure atomic-mode latency estimates."
+    )
+if args.graph_walk and args.dual_kvm:
+    parser.error("--graph-walk cannot be combined with --dual-kvm.")
+if args.graph_walk and args.kvm_boot and args.kvm_dest != "timing":
+    parser.error(
+        "--graph-walk with --kvm-boot requires --kvm-dest timing."
+    )
+if args.graph_walk and (args.graph_nodes < 2 or args.graph_degree < 1
+                        or args.graph_steps < 1):
+    parser.error("--graph-nodes >= 2, --graph-degree >= 1, "
+                 "--graph-steps >= 1 required.")
+# --graph-transfer: the graph-walk guest drives the runtime migration.
+# Note this does NOT weaken the host_cmd conflict above -- the
+# --runtime-transfer FLAG stays rejected against --graph-walk, because
+# that flow assigns host_cmd itself. What becomes reachable here is the
+# transfer CAPABILITY (maybe_fire), which is flow-agnostic: it greps the
+# serial file and is invoked from every handler activation regardless of
+# which flow built the guest command.
+if args.graph_transfer and args.graph_walk != "device":
+    parser.error(
+        "--graph-transfer requires --graph-walk device: the migration "
+        "exists so the DEVICE walks a region whose authority it holds."
+    )
+if args.graph_transfer and not (
+    args.host_integrity and args.device_integrity
+):
+    parser.error(
+        "--graph-transfer requires both --host-integrity and "
+        "--device-integrity (host releases, device acquires -- both "
+        "verifiers must exist)."
+    )
+if args.graph_transfer and args.held_region:
+    parser.error(
+        "--graph-transfer and --held-region are mutually exclusive. "
+        "--held-region populates the held state from params at init(), "
+        "i.e. BEFORE the guest runs, so the host is already the Releaser "
+        "when graph_walk_host.c writes the CSR and the first store hits "
+        "the walk-entry panic. --graph-transfer is the runtime form: "
+        "both verifiers boot inert and the release happens after the "
+        "flush."
+    )
+if args.graph_transfer_quiesce_us < 0:
+    parser.error("--graph-transfer-quiesce-us must be >= 0.")
+# --observe-cxl: the observer counts only on the TIMING path, and under
+# KVM the CXL ranges are a KVM memslot so no packet exists to observe.
+# Reject the combinations that can NEVER reach TIMING rather than let
+# the run report a zero that looks like a measurement.
+if args.dispatch_block and args.atomic:
+    parser.error(
+        "--dispatch-block cannot be combined with --atomic: a held "
+        "read cannot exist outside timing mode (the gate fatals at "
+        "init anyway)."
+    )
+if args.dispatch_block and args.dual_kvm:
+    parser.error(
+        "--dispatch-block cannot be combined with --dual-kvm: the run "
+        "never leaves KVM, where CXL DRAM is a KVM memslot and guest "
+        "accesses never become packets. Nothing would be held."
+    )
+if args.dispatch_block and args.kvm_boot and args.kvm_dest != "timing":
+    parser.error(
+        "--dispatch-block with --kvm-boot requires --kvm-dest timing: "
+        "an ATOMIC workload phase produces no held read."
+    )
+if args.dispatch_block and (args.take_checkpoint or args.restore):
+    parser.error(
+        "--dispatch-block cannot be combined with --take-checkpoint/"
+        "--restore: a held load blocks the pre-checkpoint drain."
+    )
+if args.observe_cxl and args.atomic:
+    parser.error(
+        "--observe-cxl cannot be combined with --atomic: the observer "
+        "counts only on the TIMING path, so the run would report zero "
+        "and that zero would not be a measurement."
+    )
+if args.observe_cxl and args.dual_kvm:
+    parser.error(
+        "--observe-cxl cannot be combined with --dual-kvm: the run "
+        "never leaves KVM, where CXL DRAM is a KVM memslot and guest "
+        "accesses never become packets. Nothing would be observable."
+    )
+if args.observe_cxl and args.kvm_boot and args.kvm_dest != "timing":
+    parser.error(
+        "--observe-cxl with --kvm-boot requires --kvm-dest timing: an "
+        "ATOMIC workload phase produces no counted traffic."
+    )
+if args.host_like_device and args.host_integrity:
+    parser.error(
+        "--host-like-device and --host-integrity are incompatible: the "
+        "verifier splice lives in the SharedL3 hierarchy the ablation "
+        "removes."
+    )
+# --cxl-latency mapping: the two protocol-processing terms are fixed
+# model values; the remainder is the CXLBridge link-flight term. The
+# result is applied post-construction (params are plain Python until
+# m5.instantiate), so with the flag absent nothing is touched.
+_CXL_BRIDGE_PROTO_NS = 12
+_CXL_CTRL_PROTO_NS = 15 if args.is_asic == "True" else 60
+if args.cxl_latency is not None:
+    _cxl_proto_sum = _CXL_BRIDGE_PROTO_NS + _CXL_CTRL_PROTO_NS
+    if args.cxl_latency <= _cxl_proto_sum:
+        parser.error(
+            f"--cxl-latency must exceed the fixed protocol terms "
+            f"({_cxl_proto_sum}ns = bridge {_CXL_BRIDGE_PROTO_NS} + "
+            f"controller {_CXL_CTRL_PROTO_NS}); the remainder is the "
+            f"bridge link-flight term."
+        )
+    _cxl_bridge_ns = args.cxl_latency - _cxl_proto_sum
 if args.kvm_boot and args.dual_kvm:
     parser.error(
         "--kvm-boot and --dual-kvm are mutually exclusive (--dual-kvm is "
@@ -884,38 +1311,263 @@ _CXL_WINDOW_BASE = 0x100000000  # matches x86_board.py's cxl_mem_start
 _CXL_WINDOW_SIZE = int(host_cxl_memory.get_size())
 _CXL_MAILBOX_SIZE = toMemorySize("16MiB")  # == MB_SIZE in cxl_mailbox.h
 _CXL_MAILBOX_BASE = _CXL_WINDOW_BASE + _CXL_WINDOW_SIZE - _CXL_MAILBOX_SIZE
+
+# --read-block slot: the mailbox STATUS field. Derived from the
+# single-sourced mailbox base above, NOT a fourth base literal. The 72
+# is `offsetof(struct cxl_mailbox, status)` -- MUST match the "off 72"
+# field in benchmarks/cxl_mailbox.h (u32 status; the neighbouring
+# `command` u32 at off 68 shares the same 64B line but does NOT
+# intersect the 4-byte slot, so the device's doorbell polls are never
+# held). The whole slot sits in one 64B line, hence on exactly one
+# DRAM channel at the 64B interleave granule.
+_RB_SLOT_OFF = 72
+_RB_SLOT_ADDR = _CXL_MAILBOX_BASE + _RB_SLOT_OFF
+_RB_SLOT_SIZE = 4
+
+# --dispatch-block gates the DEVICE's doorbell poll: the same mechanism
+# pointed the other way. The device polls `command`, which is the word
+# ADJACENT to `status` in the same 64B line but a disjoint 4-byte slot,
+# so the two gates can never match each other's word.
+_DB_SLOT_OFF = 68
+_DB_SLOT_ADDR = _CXL_MAILBOX_BASE + _DB_SLOT_OFF
+_DB_SLOT_SIZE = 4
+
+
+def _check_mailbox_slot(field, off, flag):
+    """Drift check for a hand-synced mailbox field offset.
+
+    No mechanism in this repo derives a config value from a guest
+    header, and reimplementing the C struct layout here would just be a
+    second drift surface -- so instead FAIL LOUDLY at startup if the
+    header both guests compile no longer documents `field` at `off`.
+    ONE source of truth (the header) shared by both slots; adding the
+    command slot adds no new hand-synced literal beyond the offset this
+    very check validates.
+    """
+    hdr = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "..", "..", "benchmarks", "cxl_mailbox.h",
+    )
+    try:
+        with open(hdr) as f:
+            decls = [
+                l.rstrip() for l in f if f"uint32_t {field};" in l
+            ]
+    except OSError as e:
+        print(f"fatal: {flag} slot drift-check cannot read {hdr}: {e}")
+        sys.exit(1)
+    if len(decls) != 1 or f"off {off}" not in decls[0]:
+        print(
+            f"fatal: {flag} slot offset drift: expected one "
+            f"'uint32_t {field};' declaration carrying 'off {off}' in "
+            f"benchmarks/cxl_mailbox.h, found {decls!r}. The gate would "
+            f"silently hold the wrong bytes; re-sync the offset with "
+            f"the struct."
+        )
+        sys.exit(1)
+
+
+if args.read_block:
+    _check_mailbox_slot("status", _RB_SLOT_OFF, "--read-block")
+if args.dispatch_block:
+    _check_mailbox_slot("command", _DB_SLOT_OFF, "--dispatch-block")
+    if (len(_status_decls) != 1
+            or f"off {_RB_SLOT_OFF}" not in _status_decls[0]):
+        print(
+            f"fatal: --read-block slot offset drift: expected one "
+            f"'uint32_t status;' declaration carrying 'off "
+            f"{_RB_SLOT_OFF}' in benchmarks/cxl_mailbox.h, found "
+            f"{_status_decls!r}. The gate would silently hold the "
+            f"wrong bytes; re-sync _RB_SLOT_OFF with the struct."
+        )
+        sys.exit(1)
+
+# --cache-probe carve: 32 MiB at absolute 0x1_4000_0000, chosen clear of
+# every other carve this config can emit (checked against this file's
+# own constants, not remembered):
+#   handoff   [0x1_0000_0000, 0x1_0010_0000)  (cxl_os start + 1 MiB)
+#   held      [0x1_2000_0000, 0x1_2000_4000)  (DEFAULT; now settable via
+#             --held-region-offset/--held-region-size, and deliberately
+#             set to overlap the graph carve in the aligned configuration)
+#   integrity [0x1_8000_0000, 0x2_FF00_0000)  (_host_cxl_os_end..full_end)
+#   mailbox   [0x2_FF00_0000, 0x3_0000_0000)  (_CXL_MAILBOX_BASE + 16M)
+# Probe carve [0x1_4000_0000, 0x1_4200_0000) touches none of them (the
+# interlocks forbid those flags anyway; the clearance is for future
+# composition). The probe itself maps and READS this range only.
+_CACHE_PROBE_BASE = 0x140000000
+_CACHE_PROBE_SIZE = toMemorySize("32MiB")
+_cache_probe_cmd = (
+    f"/home/cxl_benchmark/cache_probe "
+    f"{_CACHE_PROBE_BASE:#x} {_CACHE_PROBE_SIZE:#x}"
+)
+# Completion echo, emitted by the guest AFTER the probe exits regardless
+# of its status (';' sequencing), so the barrier terminates on failed
+# probes too. Quote-split like _xfer_marker_echo so no script text ever
+# contains the contiguous marker. The probe's own final "CACHE PROBE
+# RESULT/ERROR" line lands in serial just before it and carries the
+# verdict; the barrier cannot key on "CACHE PROBE" directly because the
+# per-mode VERDICT lines print mid-probe and would end the run early.
+_CACHE_PROBE_DONE = "CACHEPROBE_DONE"
+_cache_probe_done_echo = "echo 'CACHEPROBE_''DONE'"
+
+# Runtime-transfer marker. The HOST guest emits it over serial; the exit
+# handler greps the serial file for it and performs the paused-instant
+# transfer. ONE SOURCE OF TRUTH: _XFER_MARKER. Both the shell echo (the
+# --runtime-transfer flow) and the MB_XFER_MARKER environment value (the
+# --graph-transfer flow, where graph_walk_host.c prints the string it is
+# handed and hardcodes nothing) are derived from it right here, so the C
+# guest and the Python trigger cannot drift. Both derivations are
+# QUOTE-SPLIT (same discipline as _kvm_marker_grep): adjacent quoted
+# shell strings concatenate, so the script text never contains the
+# contiguous marker -- only the executed echo, or the exported value,
+# carries it. Distinct from every PASS/boot string the barriers key on.
+_XFER_MARKER = "F2XFER_RELEASE_GO"
+_XFER_SPLIT = 7  # len("F2XFER_"); keeps the emitted text byte-identical
+_xfer_marker_sh = (
+    f"'{_XFER_MARKER[:_XFER_SPLIT]}''{_XFER_MARKER[_XFER_SPLIT:]}'"
+)
+_xfer_marker_echo = f"echo {_xfer_marker_sh}"
+
+# --graph-walk carve + command. Same base as the cache-probe carve (the
+# two flags are mutually exclusive), sized from the graph parameters:
+# header page + (N+1)*4 offsets (64B-aligned) + N*D*4 edges, rounded up
+# to MiB for memmap=. The SEED is fixed here and travels to both
+# executors through one command line and the in-region gw_header, which
+# is what makes the two configs' walks identical.
+_GW_BASE = 0x140000000
+_GW_SEED = 42
+if args.graph_walk:
+    _gw_offs = (4096 + (args.graph_nodes + 1) * 4 + 63) & ~63
+    _gw_bytes = _gw_offs + args.graph_nodes * args.graph_degree * 4
+    _GW_CARVE = max(2 << 20, (_gw_bytes + (1 << 20) - 1) & ~((1 << 20) - 1))
+    assert _GW_BASE + _GW_CARVE <= 0x180000000, (
+        "graph carve would reach the integrity-carve region; shrink "
+        "--graph-nodes/--graph-degree"
+    )
+    # --graph-transfer arms the guest through the environment (the
+    # MB_POLL_US idiom): MB_XFER_MARKER both ENABLES the guest's
+    # release signal and supplies the exact string the trigger greps
+    # for, so there is nothing to keep in sync by hand. Absent the
+    # flag no variables are exported and the command is byte-identical
+    # to what it was.
+    #
+    # MB_POLL_US/MB_TIMEOUT_S are threaded unconditionally: this guest
+    # reads both (its completion poll drives config 2's bracket), and
+    # until now received neither, so --poll-us was silently ignored here
+    # and the budget was whatever was compiled in. At the flag defaults
+    # both values equal the compiled-in ones, so behaviour is unchanged.
+    _gw_env = (
+        f"MB_POLL_US={args.poll_us} MB_TIMEOUT_S={args.timeout_s} "
+    )
+    if args.graph_transfer:
+        _gw_env += (
+            f"MB_XFER_MARKER={_xfer_marker_sh} "
+            f"MB_XFER_QUIESCE_US={args.graph_transfer_quiesce_us} "
+        )
+    _gw_cmd = (
+        f"{_gw_env}/home/cxl_benchmark/graph_walk_host {args.graph_walk} "
+        f"{_GW_BASE:#x} {_GW_CARVE:#x} {args.graph_nodes} "
+        f"{args.graph_degree} {args.graph_steps} {_GW_SEED}"
+    )
+_GW_DONE = "GRAPHWALK_DONE"
+_gw_done_echo = "echo 'GRAPHWALK_''DONE'"
 _CXL_PROTECTED_SIZE = toMemorySize("2GiB")  # == device board's default carve
 
-# --held-region geometry. The region must have an EXACT covering tree node:
-# for TimingBmt at arity 4 that means a 16 KiB (arity * 4 KiB page) region,
-# 16 KiB-aligned, whose attachment node j = offset/16KiB has no
-# counter-bearing heap children (arity*j + 1 >= leaves). For the 2 GiB
-# protected carve, leaves = (2GiB/4096)/4 = 131072, so the lowest qualifying
-# offset is 32768 * 16KiB = 0x20000000 (covering node 32768). The verifier
+# --held-region geometry. The region must have an EXACT covering tree node.
+# Counters attach at the tree's LEAF layer, so coverage is contiguous and the
+# admissible shapes are the arity^k family: for arity 4 over the 2 GiB carve,
+# a size of 16 KiB, 64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB, 64 MiB, 256 MiB or
+# 1 GiB, each aligned to its OWN size (plus the whole 2 GiB range at node 0).
+# Offset 0 is admissible; there is no lower bound on the offset. The verifier
 # re-derives and enforces all of this at init(); any other region fatals.
-_HELD_REGION_OFFSET = 0x20000000  # lowest offset with an exact covering node
-_HELD_REGION_SIZE = toMemorySize("16KiB")  # arity(4) * page(4KiB)
+# This 16 KiB region at offset 0x20000000 derives covering node 120149
+# (= first leaf 87381 + 0x20000000/16KiB); it is kept where it was so the
+# measurement stays comparable, not because lower offsets are unavailable.
+_HELD_REGION_OFFSET = args.held_region_offset
+_HELD_REGION_SIZE = toMemorySize(args.held_region_size)
 _HELD_REGION_BASE = _CXL_WINDOW_BASE + _HELD_REGION_OFFSET
 
-# --runtime-transfer marker. The HOST guest emits it over serial; the exit
-# handler greps the serial file for it and performs the paused-instant
-# transfer. The guest-side echo is QUOTE-SPLIT (same discipline as
-# _kvm_marker_grep) so the script text never contains the contiguous
-# marker -- only the executed echo puts it in the serial file. Distinct
-# from every PASS/boot string the barriers key on.
-_XFER_MARKER = "F2XFER_RELEASE_GO"
-_xfer_marker_echo = "echo 'F2XFER_''RELEASE_GO'"
+# --graph-walk + --held-region: the whole point of combining them is that
+# the region whose authority the host RELEASES is the region the device
+# then WALKS. A run where they are silently different memory produces a
+# plausible number measuring nothing, so refuse at parse time. (The
+# verifier separately enforces the region's own shape/containment at
+# init(); this is the one relationship only the config can see.)
+# True whenever a held-region GEOMETRY is in play -- statically populated
+# (--held-region), released at runtime by its own flow
+# (--runtime-transfer), or released at runtime by the graph-walk guest
+# (--graph-transfer). Drives the containment check, the memmap= carve and
+# the banner. It does NOT drive the verifiers' held_region_* params:
+# those stay keyed on --held-region alone, so both runtime forms boot
+# inert and the release happens after the guest has built the region.
+_held_geometry_active = bool(
+    args.held_region or args.runtime_transfer or args.graph_transfer
+)
+
+if args.graph_walk and _held_geometry_active:
+    _gw_end = _GW_BASE + _GW_CARVE
+    _held_end = _HELD_REGION_BASE + _HELD_REGION_SIZE
+    if _GW_BASE < _HELD_REGION_BASE or _gw_end > _held_end:
+        # Smallest admissible (arity^k) shape that would contain the graph.
+        _adm = toMemorySize("16KiB")
+        while _adm < _GW_CARVE:
+            _adm *= 4
+        parser.error(
+            f"graph carve [{_GW_BASE:#x}..{_gw_end:#x}) is not inside the "
+            f"held region [{_HELD_REGION_BASE:#x}..{_held_end:#x}). With "
+            f"both configured the handed-off region must BE the region the "
+            f"device walks. Align them, e.g. --held-region-offset "
+            f"{_GW_BASE - _CXL_WINDOW_BASE:#x} --held-region-size "
+            f"{_adm >> 20}MiB."
+        )
+
+# True when the held-region carve already covers the graph carve, so the
+# graph block emits no second (nested, identical-type) memmap= entry.
+_gw_carve_covered_by_held = bool(
+    args.graph_walk
+    and _held_geometry_active
+    and _GW_BASE >= _HELD_REGION_BASE
+    and _GW_BASE + _GW_CARVE <= _HELD_REGION_BASE + _HELD_REGION_SIZE
+)
+
+# (_XFER_MARKER and its derivations are defined above, before the
+# graph-walk command that also consumes them.)
+
+# Device memory hierarchy + clock, SINGLE-SOURCED so --host-like-device
+# reads the device's real configuration instead of duplicating literals
+# (the two cannot drift). Values are the Cortex-A72 mimicry (TRM): L1I
+# 48kB 3-way, L1D 32kB 2-way, unified L2 1MB 16-way, 64B lines; the L2
+# SIZE (A72 allows 512kB-4MB; 1MB is the BCM2711/Raspberry Pi 4 choice)
+# and the 1.5GHz clock (BCM2711; the A72 has no default frequency) are
+# implementation choices, not fixed A72 values. NOTE: the A72's L2 is
+# SHARED across the cluster; PrivateL1PrivateL2 replicates it per core,
+# structurally identical only at --device-cores 1.
+_device_cache_params = dict(
+    l1d_size="32kB",
+    l1d_assoc=2,
+    l1i_size="48kB",
+    l1i_assoc=3,
+    l2_size="1MB",
+    l2_assoc=16,
+)
+_DEVICE_CLK = "1.5GHz"
 
 # Both host_cache branches share the exact same cache geometry.
+# Resized 2026-08: the previous 96MB/48-way L3 on a single-core host was
+# not a realistic model and forced the CXL-miss working set past 192 MiB
+# before the host missed to CXL, making timing-mode runs impractically
+# long. This configuration is taken from a published single-core
+# evaluation setup: 32kB/8 L1s, 2MB/16 L2, 16MB/32 L3. Total below the
+# CXL link: 32K + 2M + 16M = ~18.03 MiB data-side.
 _host_cache_params = dict(
-    l1d_size="48kB",
-    l1d_assoc=6,
+    l1d_size="32kB",
+    l1d_assoc=8,
     l1i_size="32kB",
     l1i_assoc=8,
     l2_size="2MB",
     l2_assoc=16,
-    l3_size="96MB",
-    l3_assoc=48,
+    l3_size="16MB",
+    l3_assoc=32,
 )
 
 if args.host_integrity:
@@ -957,6 +1609,25 @@ if args.host_integrity:
         metadata_cache_size="128KiB",
         metadata_cache_assoc=8,
     )
+elif args.host_like_device:
+    # ABLATION, not a new default: give the host EXACTLY the device's
+    # hierarchy (same class, sizes, assocs, no L3 at all -- matching
+    # the classes means losing the L3, not shrinking it), read from
+    # _device_cache_params so the two cannot drift. Together with the
+    # matched clock below, this removes the core/cache asymmetry so a
+    # graph-walk comparison isolates what memory PLACEMENT alone buys.
+    #
+    # membus is passed EXPLICITLY: the class's `membus=` default is
+    # evaluated once at class-definition time, so two instances built
+    # with the default SHARE one SystemXBar -- the host board claims it
+    # and the device board then fails elaboration with an orphaned,
+    # membus-less hierarchy (the verifier hierarchy dodges the same
+    # trap, "Fresh membus per instance"). Parameters stay single-
+    # sourced; only the constructed OBJECTS are per-board.
+    host_cache = PrivateL1PrivateL2CacheHierarchy(
+        **_device_cache_params,
+        membus=PrivateL1PrivateL2CacheHierarchy._get_default_membus(),
+    )
 else:
     host_cache = PrivateL1PrivateL2SharedL3CacheHierarchy(**_host_cache_params)
 
@@ -981,14 +1652,37 @@ else:
     )
 
 host_board = X86Board(
-    clk_freq="2.4GHz",
+    # --host-like-device (ablation): match the device clock too, so the
+    # only remaining asymmetry is memory placement.
+    clk_freq=_DEVICE_CLK if args.host_like_device else "2.4GHz",
     processor=host_processor,
     memory=host_memory,
     cache_hierarchy=host_cache,
     cxl_memory=host_cxl_memory,
     is_asic=(args.is_asic == "True"),
     enable_nmp=False,
+    # --read-block: gates spliced between cxl_mem_bus and each CXL DRAM
+    # channel controller. 0/0 (flag off) -> no gates, wiring identical.
+    cxl_read_block_addr=_RB_SLOT_ADDR if args.read_block else 0,
+    cxl_read_block_size=_RB_SLOT_SIZE if args.read_block else 0,
+    # --dispatch-block: the mirror gate over the command word.
+    cxl_dispatch_block_addr=_DB_SLOT_ADDR if args.dispatch_block else 0,
+    cxl_dispatch_block_size=_DB_SLOT_SIZE if args.dispatch_block else 0,
+    # --observe-cxl: observed range = the protected CXL OS carve. Chosen
+    # over the held region because it is defined whenever integrity is
+    # meaningful (with or without a handoff), it is literally "the
+    # protected region" of the claim, and it is a SUPERSET of any held
+    # region, so nothing observable is excluded. Cost is bounded: 2 GiB
+    # / 64 B = 33,554,432 lines = one 4 MiB coverage bitmap.
+    cxl_observe_addr=_CXL_WINDOW_BASE if args.observe_cxl else 0,
+    cxl_observe_size=_CXL_PROTECTED_SIZE if args.observe_cxl else 0,
 )
+
+# --cxl-latency: retune the host's CXLBridge link-flight term after
+# construction (params stay plain Python attrs until m5.instantiate).
+# Flag absent -> nothing touched, x86_board.py's 50ns/12ns stand.
+if args.cxl_latency is not None:
+    host_board.bridge.bridge_lat = f"{_cxl_bridge_ns}ns"
 
 
 # =============================================================================
@@ -1006,11 +1700,28 @@ cxl_mem_range = AddrRange(
 # access test, but pointed at the host's cxl_mem_bus instead of a
 # private one
 # =============================================================================
-device_cache = PrivateL1PrivateL2CacheHierarchy(
-    l1d_size="32kB",
-    l1i_size="32kB",
-    l2_size="512kB",
-)
+# Device memory hierarchy mimicking an ARM Cortex-A72 (TRM values): L1I
+# 48kB 3-way, L1D 32kB 2-way, unified L2 1MB 16-way, 64B lines (the
+# System-level cache_line_size default). The L2 SIZE (A72 allows
+# 512kB-4MB; 1MB is the BCM2711/Raspberry Pi 4 configuration) and the
+# 1.5GHz device clock below are implementation choices, not fixed A72
+# values. CPU model and ISA are deliberately unchanged -- geometry and
+# clock only. NOTE: the A72's L2 is SHARED across the cluster; this
+# hierarchy replicates a private L2 per core, which is structurally
+# identical only at --device-cores 1 (N cores get N private 1MB L2s).
+device_cache = PrivateL1PrivateL2CacheHierarchy(**_device_cache_params)
+if args.host_like_device:
+    # Regression guard for the shared-default-membus trap (see the
+    # host_cache ablation branch): same PARAMETERS, but the host and
+    # device hierarchies must be distinct objects with distinct
+    # membuses, or the second board to elaborate loses its bus.
+    assert host_cache is not device_cache, (
+        "host and device share one hierarchy instance"
+    )
+    assert host_cache.membus is not device_cache.membus, (
+        "host and device hierarchies share one membus instance "
+        "(class-default membus leaked; pass a fresh one explicitly)"
+    )
 device_memory = SingleChannelDDR3_1600(size="512MB")
 
 # Device: TIMING-only from tick 0 (dual-KVM fallback documented in the
@@ -1064,7 +1775,10 @@ if args.kvm_no_perf:
             _core.get_simobject().usePerf = False
 
 device_board = DeviceX86Board(
-    clk_freq="1GHz",
+    # Cortex-A72 mimicry clock (single-sourced _DEVICE_CLK; rationale at
+    # its definition). One SrcClockDomain for the whole board: cores,
+    # caches, cxl_verifier, and cxl_metadata_cache share it.
+    clk_freq=_DEVICE_CLK,
     processor=device_processor,
     memory=device_memory,
     cache_hierarchy=device_cache,
@@ -1205,6 +1919,45 @@ if args.runtime_transfer and not args.kvm_boot:
         + ";m5 exit;"
     )
 
+# --cache-probe (default TIMING flow): the host runs the probe, then the
+# unconditional completion echo the barrier keys on. The device keeps
+# the stock boot-PASS command. The --kvm-boot variant runs the probe in
+# the phase-2 (post-switch) script instead, below.
+if args.cache_probe and not args.kvm_boot:
+    host_cmd = (
+        "echo '=== host: X86Board (cache probe) ===';"
+        + "echo 'host boot OK';"
+        + _cache_probe_cmd + ";"
+        + _cache_probe_done_echo + ";"
+        + "m5 exit;"
+    )
+
+# --graph-walk (default TIMING flow): host builds+flushes+runs (config
+# 1) or builds+flushes+dispatches (config 2); the unconditional done
+# echo terminates the barrier either way. In config 2 the device runs
+# device_offload, which waits on the doorbell and prints its
+# every-exit-path "DEVICE OFFLOAD" prefix.
+if args.graph_walk and not args.kvm_boot:
+    host_cmd = (
+        "echo '=== host: X86Board (graph walk) ===';"
+        + "echo 'host boot OK';"
+        + _gw_cmd + ";"
+        + _gw_done_echo + ";"
+        + "m5 exit;"
+    )
+    if args.graph_walk == "device":
+        # MB_POLL_US threads --poll-us to the DEVICE's doorbell poll
+        # too (device_offload.c reads it; default 1000 == its
+        # compiled-in default). The device pickup latency sits inside
+        # config 2's host-side bracket, so it must be tunable.
+        device_cmd = (
+            "echo 'device boot OK';"
+            + f"MB_POLL_US={args.poll_us} "
+            + f"MB_TIMEOUT_S={args.timeout_s} "
+            + "/home/cxl_benchmark/device_offload;"
+            + "m5 exit;"
+        )
+
 if args.take_checkpoint or args.restore:
     host_cmd = "echo 'host boot OK'; " + _liveness_loop
     device_cmd = "echo 'device boot OK'; " + _write_sentinel + _device_loop
@@ -1230,10 +1983,22 @@ if args.offload:
         # already configured with the same range at instantiation.
         _ho_base = device_board._cxl_handoff_start
         _ho_size = device_board._cxl_handoff_size
-        _host_work = f"/home/cxl_benchmark/host_offload handoff {_ho_base:#x} {_ho_size};"
+        # MB_POLL_US threads --poll-us into the guest (sh env-prefix
+        # syntax); host_offload.c reads it at startup, 0 = busy-spin.
+        _host_work = (
+            f"MB_POLL_US={args.poll_us} MB_TIMEOUT_S={args.timeout_s} "
+            f"/home/cxl_benchmark/host_offload handoff "
+            f"{_ho_base:#x} {_ho_size};"
+        )
     else:
-        _host_work = "/home/cxl_benchmark/host_offload;"
-    _device_work = "/home/cxl_benchmark/device_offload;"
+        _host_work = (
+            f"MB_POLL_US={args.poll_us} MB_TIMEOUT_S={args.timeout_s} "
+            f"/home/cxl_benchmark/host_offload;"
+        )
+    _device_work = (
+        f"MB_POLL_US={args.poll_us} MB_TIMEOUT_S={args.timeout_s} "
+        f"/home/cxl_benchmark/device_offload;"
+    )
     host_cmd = "echo 'host boot OK'; " + _host_work + " m5 exit;"
     device_cmd = "echo 'device boot OK'; " + _device_work + " m5 exit;"
 
@@ -1280,13 +2045,50 @@ if args.kvm_boot:
     if args.offload:
         _host_phase2 = (
             f"# {_KVM_PHASE2_MARKER}\n"
-            "echo 'host phase2 start (ATOMIC)'\n"
+            f"echo 'host phase2 start ({args.kvm_dest.upper()})'\n"
             f"{_host_work}\n" + _KVM_PHASE2_TAIL
         )
         _device_phase2 = (
             f"# {_KVM_PHASE2_MARKER}\n"
-            "echo 'device phase2 start (ATOMIC)'\n"
+            f"echo 'device phase2 start ({args.kvm_dest.upper()})'\n"
             f"{_device_work}\n" + _KVM_PHASE2_TAIL
+        )
+    elif args.cache_probe:
+        # Probe runs post-switch (under --kvm-dest timing this is the
+        # timing-fidelity verdict). The completion echo follows the
+        # probe unconditionally; the device's phase 2 is the stock
+        # post-switch echo, which is its half of the barrier.
+        _host_phase2 = (
+            f"# {_KVM_PHASE2_MARKER}\n"
+            "echo 'host phase2 start (cache probe)'\n"
+            f"{_cache_probe_cmd}\n"
+            f"{_cache_probe_done_echo}\n" + _KVM_PHASE2_TAIL
+        )
+        _device_phase2 = (
+            f"# {_KVM_PHASE2_MARKER}\n"
+            "echo 'device post-switch OK'\n" + _KVM_PHASE2_TAIL
+        )
+    elif args.graph_walk:
+        # Walk (or dispatch) runs post-switch under the TIMING
+        # destination the interlock enforces. Config 2's device phase 2
+        # runs device_offload (doorbell consumer); config 1's is the
+        # stock post-switch echo.
+        _host_phase2 = (
+            f"# {_KVM_PHASE2_MARKER}\n"
+            "echo 'host phase2 start (graph walk)'\n"
+            f"{_gw_cmd}\n"
+            f"{_gw_done_echo}\n" + _KVM_PHASE2_TAIL
+        )
+        _dev_work_gw = (
+            f"MB_POLL_US={args.poll_us} "
+            f"MB_TIMEOUT_S={args.timeout_s} "
+            "/home/cxl_benchmark/device_offload\n"
+            if args.graph_walk == "device" else ""
+        )
+        _device_phase2 = (
+            f"# {_KVM_PHASE2_MARKER}\n"
+            "echo 'device post-switch OK'\n"
+            + _dev_work_gw + _KVM_PHASE2_TAIL
         )
     else:
         # Plain --kvm-boot smoke: phase 2 just proves the switch landed and
@@ -1359,18 +2161,54 @@ if args.host_integrity:
         _intg_size % (1 << 20) == 0
     ), "integrity carve size must be MiB-aligned for the memmap= carve"
     _host_memmap_args.append(f"memmap={_intg_size >> 20}M${_intg_base:#x}")
-if args.held_region or args.runtime_transfer:
+if _held_geometry_active:
     # Keep the host page allocator off the held/released region: the host
     # verifier panics -- by design -- on any walk into it once it is a
     # Releaser, so only a deliberate access (e.g. /dev/mem at the region
     # base, the release-invariant test) may ever reach it. Emitted at BOOT
     # in both modes (kernel args are fixed at boot) even though under
-    # --runtime-transfer the release happens later. 16 KiB carve,
-    # K-granularity memmap= (the other carves are MiB-granularity).
+    # --runtime-transfer the release happens later. K-granularity memmap=
+    # for sub-MiB regions (the default 16 KiB), M-granularity otherwise.
+    #
+    # When a --graph-walk carve nests inside this region (the aligned
+    # configuration) this ONE carve serves both purposes: both are plain
+    # Reserved ranges, and Reserved is exactly what the graph carve needs
+    # too -- allocator kept out, /dev/mem-mmappable, and cacheable when
+    # mapped without O_SYNC. The graph block below then emits nothing,
+    # rather than nesting a second Reserved carve inside this one.
     assert _HELD_REGION_SIZE % (1 << 10) == 0
+    if _HELD_REGION_SIZE % (1 << 20) == 0:
+        _host_memmap_args.append(
+            f"memmap={_HELD_REGION_SIZE >> 20}M${_HELD_REGION_BASE:#x}"
+        )
+    else:
+        _host_memmap_args.append(
+            f"memmap={_HELD_REGION_SIZE >> 10}K${_HELD_REGION_BASE:#x}"
+        )
+if args.cache_probe:
+    # Dedicated Reserved carve for the cacheability probe: keeps the
+    # host page allocator out of the probed range and makes it
+    # /dev/mem-mmappable under STRICT_DEVMEM (the mailbox precedent).
+    assert _CACHE_PROBE_SIZE % (1 << 20) == 0
     _host_memmap_args.append(
-        f"memmap={_HELD_REGION_SIZE >> 10}K${_HELD_REGION_BASE:#x}"
+        f"memmap={_CACHE_PROBE_SIZE >> 20}M${_CACHE_PROBE_BASE:#x}"
     )
+if args.graph_walk:
+    # Graph region carve (host side; the device sees the whole window
+    # Reserved already). Mapped WITHOUT O_SYNC by both guests ->
+    # CACHEABLE (the measured cache_probe result) -- the premise of the
+    # whole comparison. Config 2 additionally needs the mailbox carve
+    # for dispatch. Skipped when the held-region carve above already
+    # covers this range (the aligned configuration): same Reserved type,
+    # same purpose, one entry in the guest's e820 instead of two nested.
+    if not _gw_carve_covered_by_held:
+        _host_memmap_args.append(
+            f"memmap={_GW_CARVE >> 20}M${_GW_BASE:#x}"
+        )
+    if args.graph_walk == "device":
+        _host_memmap_args.append(
+            f"memmap={_CXL_MAILBOX_SIZE >> 20}M${_CXL_MAILBOX_BASE:#x}"
+        )
 if _host_memmap_args:
     host_workload_kwargs["kernel_args"] = (
         host_board.get_default_kernel_args() + _host_memmap_args
@@ -1417,6 +2255,28 @@ elif args.take_checkpoint:
     # sentinel write/read can never produce a poisoned checkpoint.
     PASS_HOST = "host boot OK"
     PASS_DEV = f"CXL={_CXL_SENTINEL}"
+elif args.cache_probe:
+    # Terminate on the guest's unconditional post-probe echo, NOT on the
+    # probe's own "CACHE PROBE" prefix: the per-mode VERDICT lines print
+    # mid-probe and a device heartbeat exit between them would end the
+    # run before the second mode measured. The echo follows the probe
+    # via ';' sequencing, so a failed/errored probe still terminates.
+    PASS_HOST = _CACHE_PROBE_DONE
+    PASS_DEV = (
+        "device post-switch OK" if args.kvm_boot else "device boot OK"
+    )
+elif args.graph_walk:
+    # Same unconditional-echo discipline. Config 2's device half keys
+    # on device_offload's every-exit-path prefix; config 1's device is
+    # a spectator and keys on its boot/post-switch echo.
+    PASS_HOST = _GW_DONE
+    if args.graph_walk == "device":
+        PASS_DEV = "DEVICE OFFLOAD"
+    else:
+        PASS_DEV = (
+            "device post-switch OK" if args.kvm_boot
+            else "device boot OK"
+        )
 elif args.offload:
     # Both offload programs print their prefix on EVERY exit path
     # (OK/FAIL/TIMEOUT/ERROR), so the barrier ends the run on failure as
@@ -1436,7 +2296,12 @@ else:
 # board/hierarchy handles; the host verifier itself is dereferenced lazily
 # inside the trigger (it is created during _pre_instantiate).
 _transfer_trigger = None
-if args.runtime_transfer:
+# The trigger is a CAPABILITY, not a property of one flow: maybe_fire
+# greps the serial file and is invoked from every handler activation, so
+# it works for whichever guest emits the marker. --runtime-transfer's own
+# script emits it; --graph-transfer has graph_walk_host.c emit it after
+# the flush. Constructed identically for both.
+if args.runtime_transfer or args.graph_transfer:
     _transfer_trigger = make_transfer_trigger(
         marker=_XFER_MARKER,
         host_serial_path=HOST_SERIAL,
@@ -1497,8 +2362,17 @@ _cpu_label = (
 print("=" * 80)
 print(f"Two-System smoke test: {_cpu_label}-only + serial-output barrier")
 print("=" * 80)
-print(
-    f"  CPU mode       : {'ATOMIC (dev-speed, no timing fidelity)' if args.atomic else 'TIMING'}"
+_cpu_mode_desc = (
+    "ATOMIC (dev-speed, no timing fidelity)" if args.atomic
+    else _cpu_label
+)
+print(f"  CPU mode       : {_cpu_mode_desc}")
+_wallclock_desc = (
+    "~minutes cold boot (ATOMIC dev-speed)" if args.atomic
+    else f"~minutes KVM boot, then workload under {args.kvm_dest.upper()}"
+    if args.kvm_boot
+    else "~minutes KVM boot" if args.dual_kvm
+    else "both ~25-30 min cold boot (parallel under TIMING)"
 )
 print(
     f"  Host board     : X86Board  ({_cpu_label}-only)  with CXLNMPDevice etc."
@@ -1516,6 +2390,141 @@ if args.host_integrity:
         f"  Host intg carve: memmap="
         f"{(_host_cxl_full_end - _host_cxl_os_end) >> 20}M"
         f"${_host_cxl_os_end:#x} (Reserved; keeps guest off the metadata)"
+    )
+if args.cache_probe:
+    print(
+        f"  Cache probe    : host runs cache_probe on Reserved carve "
+        f"[{_CACHE_PROBE_BASE:#x}..{_CACHE_PROBE_BASE + _CACHE_PROBE_SIZE:#x})"
+    )
+    print(
+        f"                   (memmap={_CACHE_PROBE_SIZE >> 20}M"
+        f"${_CACHE_PROBE_BASE:#x}); grep host serial for 'CACHE PROBE' "
+        f"(verdicts + RESULT); run ends on '{_CACHE_PROBE_DONE}'"
+    )
+_cxl_lat_total = (args.cxl_latency if args.cxl_latency is not None
+                  else 50 + _CXL_BRIDGE_PROTO_NS + _CXL_CTRL_PROTO_NS)
+_cxl_lat_bridge = (_cxl_bridge_ns if args.cxl_latency is not None else 50)
+_cxl_lat_src = ("default, params untouched"
+                if args.cxl_latency is None else "--cxl-latency override")
+print(
+    f"  CXL latency    : {_cxl_lat_total}ns one-way "
+    f"(bridge_lat {_cxl_lat_bridge} + bridge proto "
+    f"{_CXL_BRIDGE_PROTO_NS} + ctrl proto {_CXL_CTRL_PROTO_NS}; "
+    f"{_cxl_lat_src}); device path untouched"
+)
+_host_hier_desc = (
+    f"DEVICE-MATCHED (ablation: PrivateL1PrivateL2, no L3, "
+    f"{_DEVICE_CLK})" if args.host_like_device
+    else "stock SharedL3 @ 2.4GHz"
+)
+print(f"  Host hierarchy : {_host_hier_desc}")
+if args.graph_walk:
+    _gw_cfg = (
+        "2 (device NMP)" if args.graph_walk == "device"
+        else "1 (host CPU)"
+    )
+    print(
+        f"  Graph walk     : config {_gw_cfg} -- "
+        f"N={args.graph_nodes} D={args.graph_degree} "
+        f"steps={args.graph_steps} seed={_GW_SEED}"
+    )
+    print(
+        f"                   CSR {_gw_bytes >> 20} MiB in cacheable carve "
+        f"[{_GW_BASE:#x}..{_GW_BASE + _GW_CARVE:#x}); grep host serial "
+        f"for 'GRAPH WALK'; compare bracketed simTicks in stats.txt"
+    )
+    # Composition line: these runs get read months from now against
+    # numbers in a paper, so the log must state what was instantiated.
+    _gw_held_on = _held_geometry_active
+    _gw_held_desc = (
+        f"[{_HELD_REGION_BASE:#x}.."
+        f"{_HELD_REGION_BASE + _HELD_REGION_SIZE:#x})"
+        if _gw_held_on else "none"
+    )
+    print(
+        f"  GW composition : host-integrity="
+        f"{'ON' if args.host_integrity else 'off'} device-integrity="
+        f"{'ON' if args.device_integrity else 'off'} "
+        f"held-region={_gw_held_desc} read-block="
+        f"{'armed' if args.read_block else 'off'}"
+    )
+    # Whether this run measured the ALIGNED configuration (the device
+    # walks the very bytes whose authority it acquired) or the older
+    # disjoint one. A log read months from now has to say which.
+    if _gw_held_on:
+        _gw_align = (
+            "graph INSIDE held region -- device walks the region it "
+            "acquired (ALIGNED)"
+            if _gw_carve_covered_by_held
+            else "graph DISJOINT from held region"
+        )
+    else:
+        _gw_align = "no held region -- plain workload, no authority transfer"
+    print(f"  GW alignment   : {_gw_align}")
+    if args.graph_transfer:
+        print(
+            f"  GW transfer    : guest-driven runtime migration ON -- "
+            f"quiesce {args.graph_transfer_quiesce_us}us, marker "
+            f"'{_XFER_MARKER}', release BEFORE m5_reset_stats (outside "
+            f"the bracket)"
+        )
+        print(
+            f"                   expect one '[transfer] host RELEASED "
+            f"then device ACQUIRED' line and covering node 37 from BOTH "
+            f"verifiers, all before the device's first walk"
+        )
+    else:
+        print(
+            f"  GW transfer    : off -- verifiers (if any) keep the "
+            f"global root; device walks climb to node 0"
+        )
+if args.observe_cxl:
+    _obs_lines = _CXL_PROTECTED_SIZE // 64
+    print(
+        f"  CXL observer   : passive, spliced at S1 (CXLMemory."
+        f"mem_req_port -> cxl_mem_bus); observing "
+        f"[{_CXL_WINDOW_BASE:#x}.."
+        f"{_CXL_WINDOW_BASE + _CXL_PROTECTED_SIZE:#x})"
+    )
+    print(
+        f"                   {_obs_lines} lines of 64 B; forwards every "
+        f"packet, acts on none, HOLDS NO COUNTER -- observability and "
+        f"cost only, no correctness claim"
+    )
+if args.dispatch_block:
+    print(
+        f"  Dispatch-block : ReadBlockGate per CXL channel, slot "
+        f"[{_DB_SLOT_ADDR:#x}..{_DB_SLOT_ADDR + _DB_SLOT_SIZE:#x}) "
+        f"(mailbox command); the DEVICE's doorbell poll read is HELD "
+        f"until the host's store arrives"
+    )
+    print(
+        f"                   NOT dispatch in hardware -- the device "
+        f"still issues the load; only the release TIMING moves to "
+        f"hardware. Pickup becomes exact, not quantised"
+    )
+if args.read_block:
+    print(
+        f"  Read-block     : ReadBlockGate per CXL channel, slot "
+        f"[{_RB_SLOT_ADDR:#x}..{_RB_SLOT_ADDR + _RB_SLOT_SIZE:#x}) "
+        f"(mailbox status); host slot reads HELD until a device store"
+    )
+    print(
+        f"                   arrives; watch each gate's init() inform() "
+        f"line and stats group 'read_block_gate'"
+    )
+if args.offload or args.graph_walk:
+    # Every flow with a poller gets the budget line; the period line is
+    # offload-specific wording kept as it was.
+    print(
+        f"  Poll budget    : MB_TIMEOUT_S={args.timeout_s} s simulated "
+        f"(time-equivalent; one value for all pollers)"
+    )
+if args.offload:
+    print(
+        f"  Poll period    : MB_POLL_US={args.poll_us} "
+        f"({'busy-spin' if args.poll_us == 0 else 'usleep'}) threaded "
+        f"into host_offload"
     )
 if args.held_region:
     print(
@@ -1548,7 +2557,7 @@ print(f"  Dev  serial    : {DEVICE_SERIAL}")
 print(f"  Barrier        : sim ends when BOTH PASS strings appear in serial")
 print(f"                   ('{PASS_HOST}' AND '{PASS_DEV}')")
 print(
-    f"  Wall-clock     : {'~minutes cold boot (ATOMIC dev-speed)' if args.atomic else 'both ~25-30 min cold boot (parallel under TIMING)'}"
+    f"  Wall-clock     : {_wallclock_desc}"
 )
 mode = (
     "take-checkpoint"
@@ -1559,6 +2568,10 @@ mode = (
     if args.offload
     else "dual-kvm boot experiment"
     if args.dual_kvm
+    else "cache-probe"
+    if args.cache_probe
+    else f"graph-walk ({args.graph_walk})"
+    if args.graph_walk
     else "smoke-test"
 )
 if args.kvm_boot:
@@ -1645,3 +2658,255 @@ if args.restore:
 print("=" * 80)
 
 simulator.run()
+
+
+def _gw_summary():
+    """Post-run digest of the FIRST stats block (m5_reset_stats ->
+    m5_dump_stats = the measurement bracket; the second block is
+    bracket + tail because dump does not reset). Read from stats.txt so
+    the numbers match exactly what offline analysis sees.
+
+    Memory-stall caveat, stated precisely: TimingSimpleCPU exposes no
+    memory-stall statistic. For this blocking in-order CPU (one
+    outstanding access, no overlap) the total DEMAND-MISS latency below
+    a cache level equals the CPU time stalled on those misses, so
+    overallMissLatency::total / simTicks is an exact stall fraction for
+    traffic below that level. It does NOT include L1-HIT service time
+    or anything the CPU does between accesses -- that remainder is
+    fetch + execute + hit-path stall.
+    """
+    import re
+
+    path = os.path.join(m5.options.outdir, "stats.txt")
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError as e:
+        print(f"[gw-summary] cannot read {path}: {e}")
+        return
+    blocks = text.split("---------- Begin Simulation Statistics ----------")
+    if len(blocks) < 2:
+        print("[gw-summary] no stats blocks found")
+        return
+    blk = blocks[1]  # FIRST dump = the bracket
+
+    def val(pattern):
+        m = re.search(pattern, blk, re.M)
+        return float(m.group(1)) if m else None
+
+    sys_prefix = "board" if args.graph_walk == "host" else "systems"
+    esc = re.escape(sys_prefix)
+
+    def cache_stats(cache):
+        # Single-element SimObjectVectors may or may not carry an index.
+        base = rf"^{esc}\.cache_hierarchy\.{cache}0?\."
+        return (
+            val(base + r"overallMisses::total\s+(\d+)"),
+            val(base + r"overallMissLatency::total\s+(\d+)"),
+            val(base + r"overallAvgMissLatency::total\s+([\d.]+)"),
+        )
+
+    sim_ticks = val(r"^simTicks\s+(\d+)")
+    if sim_ticks is None:
+        print("[gw-summary] simTicks missing from first block")
+        return
+
+    print("=" * 72)
+    print(f"[gw-summary] mode={args.graph_walk}  walking System: "
+          f"{sys_prefix}  (FIRST stats block = the bracket)")
+    print(f"[gw-summary] bracketed: {sim_ticks:.0f} ticks = "
+          f"{sim_ticks / 1e9:.2f} ms simulated")
+
+    levels = [("l1dcaches", "L1D"), ("l1icaches", "L1I"),
+              ("l2caches", "L2")]
+    if args.graph_walk == "host" and not args.host_like_device:
+        levels.append(("l3cache", "L3"))
+    l1d_lat = None
+    l1i_lat = None
+    for cache, label in levels:
+        misses, lat, avg = cache_stats(cache)
+        if misses is None:
+            print(f"[gw-summary] {label:4s}: stats not found "
+                  f"(naming drift -- check stats.txt by hand)")
+            continue
+        print(f"[gw-summary] {label:4s}: {misses:>10.0f} misses, "
+              f"avg {avg / 1e3 if avg else 0:8.1f} ns below, "
+              f"total {lat / 1e9:8.2f} ms")
+        if cache == "l1dcaches":
+            l1d_lat = lat
+        if cache == "l1icaches":
+            l1i_lat = lat
+
+    # Committed inst/op counts for the System that ran the walk. Under
+    # --kvm-boot BOTH core sets exist in stats.txt with the same leaf
+    # names -- processor.start.core.* (the switched-out KVM core,
+    # zeroed) and processor.switch.core.* (the TIMING core that did the
+    # work) -- so a naive first-match hits the zeroed one. Real paths
+    # read from m5out/gw-B2-symcore-h/stats.txt:
+    #   board.processor.switch.core.commitStats0.numInsts
+    # Non-switch runs have processor.cores*.core instead. Collect every
+    # candidate and take the MAX (the active core; switched-out cores
+    # report 0), printing which path was used.
+    def _core_stat(leaf):
+        cands = re.findall(
+            rf"^({esc}\.processor\.(?:start|switch|cores\d*)\.core"
+            rf"\.commitStats0\.{leaf})\s+(\d+)", blk, re.M)
+        if not cands:
+            return None, None
+        path, v = max(cands, key=lambda c: int(c[1]))
+        return path, int(v)
+
+    _ipath, insts = _core_stat("numInsts")
+    _, ops = _core_stat("numOps")
+    if insts is None:
+        print(f"[gw-summary] insts: n/a (no commitStats0.numInsts "
+              f"under {sys_prefix}.processor.* in block 1)")
+    else:
+        print(f"[gw-summary] insts: {insts}  ops: {ops}  "
+              f"(from {_ipath})")
+
+    if l1d_lat is not None:
+        frac = l1d_lat / sim_ticks
+        print(f"[gw-summary] demand-miss stall below L1D: "
+              f"{l1d_lat / 1e9:.2f} ms = {frac * 100:.1f}% of bracket "
+              f"(exact for this blocking CPU; excludes L1-hit service "
+              f"time)")
+    if l1i_lat is not None and sim_ticks > 0:
+        print(f"[gw-summary] ifetch-miss stall below L1I: "
+              f"{l1i_lat / 1e9:.2f} ms = "
+              f"{l1i_lat / sim_ticks * 100:.1f}% of bracket")
+    if l1d_lat is not None:
+        rest = sim_ticks - l1d_lat - (l1i_lat or 0)
+        print(f"[gw-summary] remainder (fetch+execute+hit-path stall"
+              f"{'+dispatch/poll' if args.graph_walk == 'device' else ''}"
+              f"): {rest / 1e9:.2f} ms = "
+              f"{rest / sim_ticks * 100:.1f}% of bracket")
+
+    # Integrity walk depth, from the verifier of the System that walked.
+    # This is the evidence that distinguishes an ACQUIRED device walk
+    # (terminates at the region's covering node, ~9 metadata fetches per
+    # chain) from a NON-acquired one (climbs to node 0, ~12) -- and, in a
+    # --graph-transfer run, from a MIXED run where some walks started
+    # before the acquire landed. The absolute counts are miss-filtered by
+    # the metadata cache, so read the RATIO and compare it against the
+    # same run without --graph-transfer; a transfer that did nothing
+    # leaves it unchanged.
+    _vpat = (rf"^{esc}\.(?:cxl_verifier|cache_hierarchy\.verifier)"
+             r"\.integrity_verifier\.")
+    md = val(_vpat + r"metadataReqHandled\s+(\d+)")
+    dd = val(_vpat + r"dataReqHandled\s+(\d+)")
+    if md is None or dd is None:
+        print("[gw-summary] verifier: no integrity_verifier stats under "
+              f"{sys_prefix} in block 1 (no verifier on the walking "
+              "System, or naming drift)")
+    else:
+        print(f"[gw-summary] verifier: {dd:.0f} data reqs, {md:.0f} "
+              f"metadata reqs, ratio {md / dd if dd else 0:.3f} "
+              f"metadata/data (lower == walks terminating earlier; "
+              f"compare across the --graph-transfer pair)")
+    print("=" * 72)
+
+
+def _observer_summary():
+    """Post-run digest of the passive S1 observer, in the [gw-summary]
+    idiom.
+
+    Event counters are reset by m5_dump_reset_stats, so they are SUMMED
+    across every block to give the run total. The coverage figure is
+    different in kind: the bitmap is recomputed at each dump and never
+    resets, so the LAST block already carries the cumulative value.
+
+    The coverage figure is the point of the object: how many distinct
+    protected lines had an observed data write-back, against how many
+    lines the observed range holds. It says what is VISIBLE here. It
+    says nothing about counter values -- the engine holds none.
+    """
+    import re
+
+    path = os.path.join(m5.options.outdir, "stats.txt")
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError as e:
+        print(f"[observer] cannot read {path}: {e}")
+        return
+    blocks = text.split(
+        "---------- Begin Simulation Statistics ----------"
+    )[1:]
+    if not blocks:
+        print("[observer] no stats blocks found")
+        return
+
+    pre = r"^\S*\.cxl_observer\.cxl_traffic_observer\."
+
+    def total(stat):
+        s = 0.0
+        found = False
+        for b in blocks:
+            m = re.search(pre + stat + r"\s+([\d.]+)", b, re.M)
+            if m:
+                s += float(m.group(1))
+                found = True
+        return s if found else None
+
+    def last(stat):
+        for b in reversed(blocks):
+            m = re.search(pre + stat + r"\s+([\d.]+)", b, re.M)
+            if m:
+                return float(m.group(1))
+        return None
+
+    pkts = total("packetsObserved")
+    if pkts is None:
+        print("[observer] no cxl_traffic_observer stats found (not "
+              "spliced, or naming drift)")
+        return
+
+    print("=" * 72)
+    print(f"[observer] S1 passive observer -- {pkts:.0f} requests seen "
+          f"on the timing path")
+    if pkts == 0:
+        print("[observer] ZERO packets observed. This is NOT a "
+              "measurement of zero: the timing path never carried "
+              "traffic here (KVM-only or atomic-only phase, or a "
+              "splice off the host's CXL path).")
+        print("=" * 72)
+        return
+
+    wbd = total("inWritebackDirty") or 0
+    wbc = total("inWritebackClean") or 0
+    wc = total("inWriteClean") or 0
+    wo = total("inWritesOtherWithData") or 0
+    ce = total("inCleanEvicts") or 0
+    print(f"[observer] in-range write-backs: WritebackDirty {wbd:.0f}, "
+          f"WritebackClean {wbc:.0f}, WriteClean {wc:.0f}, other "
+          f"{wo:.0f}  (total {wbd + wbc + wc + wo:.0f})")
+    print(f"[observer] in-range CleanEvict: {ce:.0f} -- carries NO "
+          f"payload and is not a write; a write-keyed observer misses "
+          f"these entirely")
+    print(f"[observer] in-range reads {total('inReads') or 0:.0f}; "
+          f"demand {total('inDemand') or 0:.0f} / prefetch "
+          f"{total('inPrefetches') or 0:.0f}")
+    print(f"[observer] verifier metadata (by tag): reads "
+          f"{total('metadataReads') or 0:.0f}, writes "
+          f"{total('metadataWrites') or 0:.0f}")
+    print(f"[observer] out-of-range: reads {total('outReads') or 0:.0f}, "
+          f"writes {total('outWritesWithData') or 0:.0f}, CleanEvict "
+          f"{total('outCleanEvicts') or 0:.0f}")
+
+    lo = last("linesObserved")
+    lr = last("linesInRange")
+    if lo is not None and lr:
+        print(f"[observer] COVERAGE: {lo:.0f} distinct lines of "
+              f"{lr:.0f} in the observed range had an observed "
+              f"data-carrying write-back ({100.0 * lo / lr:.4f}%)")
+        print(f"[observer] (cumulative for the run. This is what is "
+              f"VISIBLE at S1 -- not a counter, and not a correctness "
+              f"claim; the engine stores no counter values.)")
+    print("=" * 72)
+
+
+if args.graph_walk:
+    _gw_summary()
+if args.observe_cxl:
+    _observer_summary()

@@ -23,25 +23,69 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "cxl_mailbox.h"
 #include "blob_abi.h"
+#include "graph_walk.h"
 
 /* Poll budget mirrors the host: the device may start before the host has
  * armed the doorbell, so it waits up to POLL_TRIES * POLL_SLEEP_US sim-us. */
-#define POLL_TRIES     100000
+/* Budget is SIMULATED TIME, not an iteration count (see the identical
+ * rationale in host_offload.c): sleeping converts the budget to an exact
+ * iteration cap before the loop -- at the default period exactly the
+ * historical 100,000 tries -- while busy-spin checks a deadline every
+ * SPIN_CHECK iterations, since one spin iteration is a UC round trip and
+ * 100,000 of them would be ~30 ms, not 100 s. MB_TIMEOUT_S overrides. */
+#define POLL_TRIES     100000          /* historical, default period */
 #define POLL_SLEEP_US  1000
+#define POLL_TIMEOUT_S 100             /* == POLL_TRIES * POLL_SLEEP_US */
+#define SPIN_CHECK     256
+
+static long g_timeout_s = POLL_TIMEOUT_S;
+
+/* Runtime doorbell-poll period: MB_POLL_US in the environment
+ * overrides POLL_SLEEP_US (threaded from the f2 config's --poll-us,
+ * mirroring host_offload.c). 0 = busy-spin -- usleep(0) still
+ * syscalls, hence the explicit branch at the call site. The device's
+ * pickup latency sits inside config 2's host-side measurement
+ * bracket, so it must be tunable. */
+static long g_poll_us = POLL_SLEEP_US;
 
 /* OP_EXEC_BLOB sanity caps — bound the shipped code and operand sizes before
  * we copy or execute anything out of the shared region. */
 #define MAX_BLOB_LEN   (1u << 20)   /* 1 MiB cap on shipped code */
 #define MAX_OPS        (1u << 20)   /* 1Mi-u64 operand cap       */
+
+static uint64_t
+now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static long
+poll_tries(void)
+{
+    if (g_poll_us <= 0)
+        return LONG_MAX;
+    return (long)(((uint64_t)g_timeout_s * 1000000ULL) /
+                  (uint64_t)g_poll_us);
+}
+
+static uint64_t
+poll_deadline(void)
+{
+    return now_ns() + (uint64_t)g_timeout_s * 1000000000ULL;
+}
 
 static uint32_t read_command(volatile struct cxl_mailbox *mb)
 {
@@ -57,6 +101,7 @@ static const char *cmd_name(uint32_t cmd)
     case OP_SUM_ARRAY:   return "OP_SUM_ARRAY";
     case OP_EXEC_BLOB:   return "OP_EXEC_BLOB";
     case OP_HANDOFF:     return "OP_HANDOFF";
+    case OP_WALK:        return "OP_WALK";
     default:             return "OP_UNKNOWN";
     }
 }
@@ -145,11 +190,75 @@ static int exec_blob(volatile struct cxl_mailbox *mb, void *map, int fd,
     return 0;
 }
 
+/* In-place variant for OP_WALK: same load-then-exec discipline as
+ * exec_blob (bounds, copy code out of the UC mailbox, W->X flip), but
+ * the blob receives a CALLER-BUILT argument block pointing into the
+ * device's own mapping of the data region — no operand copy, no
+ * MAX_OPS cap. Deliberately a SEPARATE function so exec_blob (the
+ * XTEA-regression-proven copy path) stays byte-identical. What the
+ * copy semantics were protecting: (a) the blob only ever touched
+ * cacheable LOCAL memory (here the mapping is cacheable too, by the
+ * measured no-O_SYNC result); (b) the operands were immutable during
+ * execution (here the host must not touch the region mid-walk — true
+ * by the dispatch protocol); (c) MAX_OPS bounded the UC copy cost
+ * (moot in place). */
+static int exec_blob_at(volatile struct cxl_mailbox *mb, void *map,
+                        int fd, uint64_t blob_off, uint64_t blob_len,
+                        void *argp, uint64_t *result_out)
+{
+    if (blob_len == 0 || blob_len > MAX_BLOB_LEN ||
+        blob_off > MB_SIZE || blob_off + blob_len > MB_SIZE) {
+        device_error(mb, map, fd, "exec blob_at bounds check failed");
+        return 1;
+    }
+
+    long pg = sysconf(_SC_PAGESIZE);
+    size_t map_len = ((size_t)blob_len + pg - 1) & ~((size_t)pg - 1);
+    void *code = mmap(NULL, map_len, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (code == MAP_FAILED) {
+        device_error(mb, map, fd, "exec blob_at mmap exec page failed");
+        return 1;
+    }
+    memcpy(code, (char *)map + blob_off, blob_len);
+    if (mprotect(code, map_len, PROT_READ | PROT_EXEC) != 0) {
+        munmap(code, map_len);
+        device_error(mb, map, fd, "exec blob_at mprotect R+X failed");
+        return 1;
+    }
+    __builtin___clear_cache((char *)code, (char *)code + blob_len);
+
+    blob_entry_fn fn = (blob_entry_fn)code;
+    *result_out = fn(argp);
+    printf("[device] blob entry() returned %llu (0x%llx) [in-place]\n",
+           (unsigned long long)*result_out,
+           (unsigned long long)*result_out);
+
+    munmap(code, map_len);
+    return 0;
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
 
+    /* Poll period: environment override, 0 = busy-spin. */
+    const char *poll_env = getenv("MB_POLL_US");
+    if (poll_env)
+        g_poll_us = atol(poll_env);
+    if (g_poll_us < 0)
+        g_poll_us = POLL_SLEEP_US;
+    const char *to_env = getenv("MB_TIMEOUT_S");
+    if (to_env)
+        g_timeout_s = atol(to_env);
+    if (g_timeout_s <= 0)
+        g_timeout_s = POLL_TIMEOUT_S;
+
     printf("=== device_offload: CXL mailbox dispatch (consumer) ===\n");
+    printf("[device] poll timeout: %ld s (time-equivalent budget)\n",
+           g_timeout_s);
+    printf("[device] poll period: %ld us%s\n",
+           g_poll_us, g_poll_us == 0 ? " (busy-spin)" : "");
 
     int fd = open("/dev/mem", O_RDWR | O_SYNC);
     if (fd < 0) {
@@ -177,13 +286,18 @@ int main(void)
     /* ---- Wait for the doorbell ---- */
     uint32_t cmd = OP_NONE;
     int rang = 0;
-    for (long t = 0; t < POLL_TRIES; t++) {
+    long tries = poll_tries();
+    uint64_t deadline = poll_deadline();
+    for (long t = 0; t < tries; t++) {
         cmd = read_command(mb);
         if (cmd != OP_NONE) {
             rang = 1;
             break;
         }
-        usleep(POLL_SLEEP_US);
+        if (g_poll_us > 0)
+            usleep(g_poll_us);
+        else if ((t & (SPIN_CHECK - 1)) == 0 && now_ns() >= deadline)
+            break;
     }
 
     if (!rang) {
@@ -318,6 +432,67 @@ int main(void)
         int rc = exec_blob(mb, map, fd, blob_off, blob_len,
                            ops_local, n, /*nonce=*/0, &result);
         free(ops_local);
+        if (rc)
+            return 1;
+        break;
+    }
+    case OP_WALK: {
+        /* Graph random walk, IN PLACE: map the graph region through a
+         * CACHEABLE mapping (/dev/mem WITHOUT O_SYNC — the measured
+         * cache_probe result; config 2's premise is that the device
+         * caches the graph in its own A72 hierarchy) and hand the blob
+         * pointers into it. Walk parameters ride the in-region
+         * gw_header, which the host built and flushed. */
+        uint64_t region_base = mb->arg0;
+        uint64_t region_size = mb->arg1;
+        uint64_t blob_off    = mb->data_off;
+        uint64_t blob_len    = mb->data_len;
+        printf("[device] op=OP_WALK region=[0x%llx..0x%llx) blob@0x%llx"
+               " len=%llu\n",
+               (unsigned long long)region_base,
+               (unsigned long long)(region_base + region_size),
+               (unsigned long long)blob_off,
+               (unsigned long long)blob_len);
+        if (region_size < GW_OFFS_OFF) {
+            device_error(mb, map, fd, "OP_WALK region too small");
+            return 1;
+        }
+        int wfd = open("/dev/mem", O_RDWR);   /* no O_SYNC: cacheable */
+        if (wfd < 0) {
+            device_error(mb, map, fd, "OP_WALK open /dev/mem failed");
+            return 1;
+        }
+        void *wmap = mmap(NULL, region_size, PROT_READ | PROT_WRITE,
+                          MAP_SHARED, wfd, (off_t)region_base);
+        if (wmap == MAP_FAILED) {
+            close(wfd);
+            device_error(mb, map, fd, "OP_WALK mmap region failed");
+            return 1;
+        }
+        const struct gw_header *hdr = (const struct gw_header *)wmap;
+        if (hdr->magic != GW_MAGIC || hdr->nodes < 2 || !hdr->degree ||
+            hdr->offs_off + (hdr->nodes + 1) * 4 > region_size ||
+            hdr->cols_off + hdr->nodes * hdr->degree * 4 > region_size) {
+            munmap(wmap, region_size);
+            close(wfd);
+            device_error(mb, map, fd, "OP_WALK bad graph header");
+            return 1;
+        }
+        printf("[device] gw_header: N=%llu D=%llu steps=%llu "
+               "seed=%llu\n",
+               (unsigned long long)hdr->nodes,
+               (unsigned long long)hdr->degree,
+               (unsigned long long)hdr->steps,
+               (unsigned long long)hdr->seed);
+        struct gw_args ga = {
+            (const uint32_t *)((char *)wmap + hdr->offs_off),
+            (const uint32_t *)((char *)wmap + hdr->cols_off),
+            hdr->nodes, hdr->steps, hdr->seed,
+        };
+        int rc = exec_blob_at(mb, map, fd, blob_off, blob_len, &ga,
+                              &result);
+        munmap(wmap, region_size);
+        close(wfd);
         if (rc)
             return 1;
         break;

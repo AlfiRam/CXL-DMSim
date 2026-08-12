@@ -179,10 +179,14 @@ TimingBmt::parentBlockIndex(size_t index)
 
         case TreeNodeType::Counter:
         // Consider the parent of a counter node to be the tree leaf node that
-        // is protecting it.
+        // is protecting it. The leaf layer begins at `treeNodes - leaves`,
+        // since the internal layers 0..height-2 occupy everything below it.
+        // (Attaching at firstOfType(TreeNode) == 0 instead would fold the
+        // tree onto its own top: counters would hang off the root and the
+        // upper internal layers, coverage would be non-contiguous, and the
+        // real leaf layer would never be visited.)
 
-        return firstOfType(TreeNodeType::TreeNode) +
-            (indexOfType(index) / arity);
+        return (treeNodes - leaves) + (indexOfType(index) / arity);
         break;
 
         case TreeNodeType::MAC:

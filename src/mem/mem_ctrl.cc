@@ -213,7 +213,11 @@ MemCtrl::addToReadQueue(PacketPtr pkt,
                         base_addr + pkt->getSize()) - addr;
         stats.readPktSize[ceilLog2(size)]++;
         stats.readBursts++;
-        stats.requestorReadAccesses[pkt->requestorId()]++;
+        // Foreign cross-System requestorIds (two-System CXL configs)
+        // are out of range for this System-sized stat vector; skip.
+        // Mirrors the AbstractMemory atomic-path guard.
+        if (pkt->requestorId() < system()->maxRequestors())
+            stats.requestorReadAccesses[pkt->requestorId()]++;
 
         // First check write buffer to see if the data is already at
         // the controller
@@ -320,7 +324,9 @@ MemCtrl::addToWriteQueue(PacketPtr pkt, unsigned int pkt_count,
                         base_addr + pkt->getSize()) - addr;
         stats.writePktSize[ceilLog2(size)]++;
         stats.writeBursts++;
-        stats.requestorWriteAccesses[pkt->requestorId()]++;
+        // Foreign cross-System requestorId guard (see addToReadQueue).
+        if (pkt->requestorId() < system()->maxRequestors())
+            stats.requestorWriteAccesses[pkt->requestorId()]++;
 
         // see if we can merge with an existing item in the write
         // queue and keep track of whether we have merged or not
@@ -819,18 +825,27 @@ MemCtrl::doBurstAccess(MemPacket* mem_pkt, MemInterface* mem_intr)
     // we will wake up sooner than we have to.
     mem_intr->nextReqTime = mem_intr->nextBurstAt - mem_intr->commandOffset();
 
-    // Update the common bus stats
+    // Update the common bus stats. Per-requestor vectors are gated
+    // against foreign cross-System requestorIds (see addToReadQueue).
+    const bool rid_ok =
+        mem_pkt->requestorId() < system()->maxRequestors();
     if (mem_pkt->isRead()) {
         ++(mem_intr->readsThisTime);
         // Update latency stats
-        stats.requestorReadTotalLat[mem_pkt->requestorId()] +=
-            mem_pkt->readyTime - mem_pkt->entryTime;
-        stats.requestorReadBytes[mem_pkt->requestorId()] += mem_pkt->size;
+        if (rid_ok) {
+            stats.requestorReadTotalLat[mem_pkt->requestorId()] +=
+                mem_pkt->readyTime - mem_pkt->entryTime;
+            stats.requestorReadBytes[mem_pkt->requestorId()] +=
+                mem_pkt->size;
+        }
     } else {
         ++(mem_intr->writesThisTime);
-        stats.requestorWriteBytes[mem_pkt->requestorId()] += mem_pkt->size;
-        stats.requestorWriteTotalLat[mem_pkt->requestorId()] +=
-            mem_pkt->readyTime - mem_pkt->entryTime;
+        if (rid_ok) {
+            stats.requestorWriteBytes[mem_pkt->requestorId()] +=
+                mem_pkt->size;
+            stats.requestorWriteTotalLat[mem_pkt->requestorId()] +=
+                mem_pkt->readyTime - mem_pkt->entryTime;
+        }
     }
 
     return cmd_at;

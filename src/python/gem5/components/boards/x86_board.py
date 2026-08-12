@@ -38,11 +38,13 @@ from m5.objects import (
     CowDiskImage,
     CXLBridge,
     CXLMemBar,
+    CxlTrafficObserver,
     IdeDisk,
     IOXBar,
     Pc,
     Port,
     RawDiskImage,
+    ReadBlockGate,
     X86E820Entry,
     X86FsLinux,
     X86IntelMPBus,
@@ -83,11 +85,45 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
         cxl_memory: AbstractMemorySystem,
         is_asic: bool,
         enable_nmp: bool = False,
+        # Read-blocking completion gate (ReadBlockGate): when
+        # cxl_read_block_size > 0, one gate is spliced between
+        # cxl_mem_bus and EACH CXL DRAM channel controller, holding
+        # timing reads inside [cxl_read_block_addr, +size) until a
+        # store to that slot arrives. Default 0/0 -> no gates, wiring
+        # bit-identical.
+        cxl_read_block_addr: int = 0,
+        cxl_read_block_size: int = 0,
+        # Mirror gate: holds the DEVICE's doorbell poll read until the
+        # host's store to the same word arrives. Same class, same
+        # position, a second instance chained per channel -- see the
+        # splice below. 0/0 -> not instantiated.
+        cxl_dispatch_block_addr: int = 0,
+        cxl_dispatch_block_size: int = 0,
+        # Passive traffic observer (CxlTrafficObserver): when
+        # cxl_observe_size > 0, one instance is spliced at S1, between
+        # CXLMemory.mem_req_port and cxl_mem_bus, where ALL host traffic
+        # to CXL DRAM passes undivided by channel. It forwards every
+        # packet and acts on none; it holds no counter. Default 0/0 ->
+        # not instantiated, wiring bit-identical.
+        cxl_observe_addr: int = 0,
+        cxl_observe_size: int = 0,
     ) -> None:
         # Set NMP flag BEFORE super().__init__() so it's available during _setup_io_devices()
         # Use object.__setattr__() to bypass gem5's SimObject attribute checking
         # This creates a regular Python attribute, not a gem5 SimObject parameter
         object.__setattr__(self, "enable_nmp", enable_nmp)
+        # Same pre-super() stash pattern as enable_nmp: consumed by
+        # _setup_io_devices() during super().__init__().
+        object.__setattr__(self, "_cxl_read_block_addr", cxl_read_block_addr)
+        object.__setattr__(self, "_cxl_read_block_size", cxl_read_block_size)
+        object.__setattr__(self, "_cxl_observe_addr", cxl_observe_addr)
+        object.__setattr__(self, "_cxl_observe_size", cxl_observe_size)
+        object.__setattr__(
+            self, "_cxl_dispatch_block_addr", cxl_dispatch_block_addr
+        )
+        object.__setattr__(
+            self, "_cxl_dispatch_block_size", cxl_dispatch_block_size
+        )
 
         super().__init__(
             clk_freq=clk_freq,
@@ -113,6 +149,10 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
 
         # Now that cache hierarchy is incorporated and membus exists, set up NMP bypass
         if self.enable_nmp:
+            # NOTE: this bypass routes host membus traffic straight to
+            # cxl_mem_bus, around the CXLMemory controller -- and so
+            # around any observer spliced at S1. The two are mutually
+            # exclusive in practice; f2 passes enable_nmp=False.
             # Direct connection: membus → cxl_mem_bus (bypass CXLBridge + CXLMemory)
             # cxl_mem_bus.cpu_side_ports is a VECTOR port - accepts multiple connections:
             # - Connection 1: CXLMemory.mem_req_port (Host path through CXL device)
@@ -217,15 +257,87 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
                 cxl_abstract_mems.append(mc.dram)
             self.memories.extend(cxl_abstract_mems)
             self.cxl_mem_bus = CXLMemBar()
-            self.cxl_mem_bus.cpu_side_ports = (
-                self.pc.south_bridge.cxlmemory.mem_req_port
-            )
+            if self._cxl_observe_size:
+                # S1 splice: CXLMemory.mem_req_port -> observer ->
+                # cxl_mem_bus. Every host access to CXL DRAM funnels
+                # through the controller's memory-side port, undivided
+                # by channel, so ONE instance sees all of it and needs
+                # no interleave arithmetic. It forwards verbatim and
+                # acts on nothing; it holds no counter.
+                #
+                # CAVEAT, load-bearing: S1 is complete for host traffic
+                # only while enable_nmp is False. With the NMP bypass on
+                # (_connect_things above) the membus is wired straight
+                # to cxl_mem_bus, and that traffic would route around
+                # this splice entirely.
+                self.cxl_observer = CxlTrafficObserver(
+                    observe_addr=self._cxl_observe_addr,
+                    observe_size=self._cxl_observe_size,
+                )
+                self.cxl_observer.cpu_side_port = (
+                    self.pc.south_bridge.cxlmemory.mem_req_port
+                )
+                self.cxl_mem_bus.cpu_side_ports = (
+                    self.cxl_observer.mem_side_port
+                )
+            else:
+                self.cxl_mem_bus.cpu_side_ports = (
+                    self.pc.south_bridge.cxlmemory.mem_req_port
+                )
             # Connect NMP device memory port to cxl_mem_bus (DIRECT access - no CXL Bridge overhead)
             self.cxl_mem_bus.cpu_side_ports = (
                 self.pc.south_bridge.nmp_device.mem_port
             )
-            for _, port in cxl_dram.get_mem_ports():
-                self.cxl_mem_bus.mem_side_ports = port
+            if self._cxl_read_block_size or self._cxl_dispatch_block_size:
+                # Read-blocking gates: one per CXL DRAM channel per
+                # gated slot, each handling only what its channel
+                # carries. A slot's 64B line lives on exactly one
+                # channel, so exactly one gate of each kind ever holds;
+                # the others forward everything and report zero holds.
+                # Per-channel splicing needs no Python-side interleave
+                # arithmetic and survives a channel-count change.
+                #
+                # When BOTH are armed they are CHAINED per channel:
+                #   bus -> completion gate -> dispatch gate -> MemCtrl
+                # A second instance of the same class, rather than a
+                # second slot inside one: the hold state, the N = 1
+                # invariant and the retry logic then stay per-object,
+                # so the two holds cannot interfere by construction
+                # rather than by a keying discipline. Their slots are
+                # disjoint 4-byte words (status at +72, command at +68)
+                # so neither gate's store test can ever match the
+                # other's word, and each forwards what it does not
+                # act on with no added latency.
+                _completion = []
+                _dispatch = []
+                for _, port in cxl_dram.get_mem_ports():
+                    _downstream = port
+                    if self._cxl_dispatch_block_size:
+                        _dg = ReadBlockGate(
+                            slot_addr=self._cxl_dispatch_block_addr,
+                            slot_size=self._cxl_dispatch_block_size,
+                            slot_label="dispatch/device-doorbell-poll",
+                        )
+                        _dg.mem_side_port = _downstream
+                        _downstream = _dg.cpu_side_port
+                        _dispatch.append(_dg)
+                    if self._cxl_read_block_size:
+                        _cg = ReadBlockGate(
+                            slot_addr=self._cxl_read_block_addr,
+                            slot_size=self._cxl_read_block_size,
+                            slot_label="completion/host-status-poll",
+                        )
+                        _cg.mem_side_port = _downstream
+                        _downstream = _cg.cpu_side_port
+                        _completion.append(_cg)
+                    self.cxl_mem_bus.mem_side_ports = _downstream
+                if _completion:
+                    self.cxl_read_block_gates = _completion
+                if _dispatch:
+                    self.cxl_dispatch_block_gates = _dispatch
+            else:
+                for _, port in cxl_dram.get_mem_ports():
+                    self.cxl_mem_bus.mem_side_ports = port
 
             self.pc.south_bridge.cxlmemory.BAR0.size = cxl_dram.get_size_str()
             if self._is_asic:

@@ -74,6 +74,9 @@ class PrivateL1PrivateL2CacheHierarchy(
         l1i_size: str,
         l2_size: str,
         membus: BaseXBar = _get_default_membus.__func__(),
+        l1d_assoc: int = 8,
+        l1i_assoc: int = 8,
+        l2_assoc: int = 16,
     ) -> None:
         """
         :param l1d_size: The size of the L1 Data Cache (e.g., "32kB").
@@ -84,17 +87,27 @@ class PrivateL1PrivateL2CacheHierarchy(
 
         :param membus: The memory bus. This parameter is optional parameter and
                        will default to a 64 bit width SystemXBar is not specified.
+
+        :param l1d_assoc: The associativity of the L1 Data Cache.
+
+        :param l1i_assoc: The associativity of the L1 Instruction Cache.
+
+        :param l2_assoc: The associativity of the L2 Cache.
         """
 
         AbstractClassicCacheHierarchy.__init__(self=self)
+        # The assoc defaults match the values the cache classes previously
+        # applied implicitly when incorporate_cache passed only `size`
+        # (L1I/L1D 8-way, L2 16-way), so callers that pass no assoc build
+        # identical caches.
         AbstractTwoLevelCacheHierarchy.__init__(
             self,
             l1i_size=l1i_size,
-            l1i_assoc=8,
+            l1i_assoc=l1i_assoc,
             l1d_size=l1d_size,
-            l1d_assoc=8,
+            l1d_assoc=l1d_assoc,
             l2_size=l2_size,
-            l2_assoc=4,
+            l2_assoc=l2_assoc,
         )
 
         self.membus = membus
@@ -116,18 +129,18 @@ class PrivateL1PrivateL2CacheHierarchy(
             self.membus.mem_side_ports = port
 
         self.l1icaches = [
-            L1ICache(size=self._l1i_size)
+            L1ICache(size=self._l1i_size, assoc=self._l1i_assoc)
             for i in range(board.get_processor().get_num_cores())
         ]
         self.l1dcaches = [
-            L1DCache(size=self._l1d_size)
+            L1DCache(size=self._l1d_size, assoc=self._l1d_assoc)
             for i in range(board.get_processor().get_num_cores())
         ]
         self.l2buses = [
             L2XBar() for i in range(board.get_processor().get_num_cores())
         ]
         self.l2caches = [
-            L2Cache(size=self._l2_size)
+            L2Cache(size=self._l2_size, assoc=self._l2_assoc)
             for i in range(board.get_processor().get_num_cores())
         ]
         # ITLB Page walk caches

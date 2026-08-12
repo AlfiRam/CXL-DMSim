@@ -84,6 +84,18 @@ enum mb_command {
                            * Device prints the handoff receipt, reads the
                            * operands out of the handed-off region, runs the
                            * blob, result = blob return (ciphertext). */
+    OP_WALK        = 5,   /* graph random walk with an IN-PLACE data pointer:
+                           * blob at [data_off, data_len) in the mailbox (as
+                           * OP_EXEC_BLOB), arg0 = graph region ABSOLUTE phys
+                           * base, arg1 = region size. The device maps the
+                           * region CACHEABLY (/dev/mem without O_SYNC) and
+                           * hands the blob POINTERS into that mapping (struct
+                           * gw_args, graph_walk.h) instead of copying
+                           * operands — a multi-MB CSR cannot ride the copy
+                           * path (MAX_OPS caps it at 8 MiB and a UC copy
+                           * would dominate the measurement). Walk parameters
+                           * travel in the in-region gw_header, which the
+                           * host flushed along with the graph. */
 };
 
 /* ---- Status values (written by the device) ---- */

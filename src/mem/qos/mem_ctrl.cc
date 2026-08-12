@@ -116,8 +116,11 @@ MemCtrl::logRequest(BusState dir, RequestorID id, uint8_t _qos,
         requestTimes[id][addr].push_back(curTick());
     }
 
-    // Record statistics
-    stats.avgPriority[id].sample(_qos);
+    // Record statistics. Per-requestor stat vectors are sized by this
+    // System's maxRequestors(); skip them for foreign cross-System ids
+    // (see addRequestor above) -- data-path bookkeeping is unaffected.
+    if (id < _system->maxRequestors())
+        stats.avgPriority[id].sample(_qos);
 
     // Compute avg priority distance
 
@@ -125,7 +128,7 @@ MemCtrl::logRequest(BusState dir, RequestorID id, uint8_t _qos,
         uint8_t distance =
             (abs(int(_qos) - int(i))) * packetPriorities[id][i];
 
-        if (distance > 0) {
+        if (distance > 0 && id < _system->maxRequestors()) {
             stats.avgPriorityDistance[id].sample(distance);
             DPRINTF(QOS,
                     "qos::MemCtrl::logRequest REQUESTOR %s [id %d]"
@@ -274,7 +277,20 @@ void
 MemCtrl::addRequestor(RequestorID id)
 {
     if (!hasRequestor(id)) {
-        requestors.emplace(id, _system->getRequestorName(id));
+        // Cross-System packets (the CXL NMP two-System configs: the
+        // device CPU reaches this host-owned memory through the shared
+        // bus) carry requestorIds from the OTHER System's namespace.
+        // getRequestorName() on this System fatals for those, and the
+        // per-requestor stat vectors below are sized by THIS System's
+        // maxRequestors() -- the TIMING-path gap documented in the
+        // AbstractMemory foreign-requestor guard. Register foreign ids
+        // under a synthetic name (the qos bookkeeping maps are keyed
+        // by id and safe for any value); the vector-stat updates are
+        // gated separately at their use sites.
+        const std::string req_name = id < _system->maxRequestors()
+            ? _system->getRequestorName(id)
+            : "foreignRequestor" + std::to_string(id);
+        requestors.emplace(id, req_name);
         packetPriorities[id].resize(numPriorities(), 0);
 
         DPRINTF(QOS,

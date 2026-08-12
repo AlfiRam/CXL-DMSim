@@ -75,6 +75,9 @@ SimObject('IntegrityVerifier.py', sim_objects=[
     ]
 )
 SimObject('PortTerminator.py', sim_objects=['PortTerminator'])
+SimObject('ReadBlockGate.py', sim_objects=['ReadBlockGate'])
+SimObject('CxlTrafficObserver.py',
+    sim_objects=['CxlTrafficObserver'])
 SimObject('ThreadBridge.py', sim_objects=['ThreadBridge'])
 
 Source('abstract_mem.cc')
@@ -115,6 +118,8 @@ Source('serial_link.cc')
 Source('mem_delay.cc')
 Source('integrity_verifier.cc')
 Source('port_terminator.cc')
+Source('read_block_gate.cc')
+Source('cxl_traffic_observer.cc')
 
 GTest('backdoor_manager.test', 'backdoor_manager.test.cc',
       'backdoor_manager.cc', with_tag('gem5_trace'))
@@ -161,6 +166,10 @@ DebugFlag('NVM')
 DebugFlag('ExternalPort')
 DebugFlag('HtmMem', 'Hardware Transactional Memory (Mem side)')
 DebugFlag('AbstractIntegrityVerifier')
+DebugFlag('ReadBlockGate', 'Hold/release activity of the read-blocking '
+          'completion gate')
+DebugFlag('CxlTrafficObserver', 'Per-packet classification by the passive '
+          'CXL traffic observer')
 DebugFlag('AbstractIntegrityVerifierInit', 'Details for initialization of '
           'integrity verifier')
 DebugFlag('AbstractIntegrityVerifierReqs', 'All requests received by an '

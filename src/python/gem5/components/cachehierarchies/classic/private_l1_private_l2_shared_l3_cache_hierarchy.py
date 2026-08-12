@@ -24,6 +24,8 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+from typing import Optional
+
 from m5.objects import (
     BadAddr,
     BaseXBar,
@@ -82,7 +84,7 @@ class PrivateL1PrivateL2SharedL3CacheHierarchy(
         l1i_assoc: int = 8,
         l2_assoc: int = 16,
         l3_assoc: int = 16,
-        membus: BaseXBar = _get_default_membus.__func__(),
+        membus: Optional[BaseXBar] = None,
     ) -> None:
         """
         :param l1d_size: The size of the L1 Data Cache (e.g., "32kB").
@@ -110,7 +112,16 @@ class PrivateL1PrivateL2SharedL3CacheHierarchy(
             l3_assoc=l3_assoc,
         )
 
-        self.membus = membus
+        # Fresh membus per instance when none is supplied (the
+        # ...integrity_verifier subclass's "Fresh membus per instance"
+        # precedent): a class-level default argument is evaluated ONCE
+        # at class-definition time, so all default-constructed
+        # instances would share one SystemXBar -- the first board to
+        # elaborate claims it and the second is left with an orphaned,
+        # membus-less hierarchy.
+        self.membus = (
+            membus if membus is not None else self._get_default_membus()
+        )
 
     @overrides(AbstractClassicCacheHierarchy)
     def get_mem_side_port(self) -> Port:

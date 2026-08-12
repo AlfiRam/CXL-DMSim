@@ -472,9 +472,12 @@ class AbstractIntegrityVerifier : public ClockedObject
      * protected-offset range [offStart, offStart + size) and nothing else.
      *
      * fatal()s if no exact covering node exists for the requested region:
-     * in TimingBmt only the whole protected range (node 0) and
-     * arity*page-sized, equally-aligned regions whose attachment node has
-     * no counter-bearing heap children are covered exactly.
+     * in TimingBmt (counters attach at the LEAF layer, so coverage is
+     * contiguous) exactly the whole protected range (node 0) plus every
+     * region whose size is arity^k * arity * PAGE_SIZE and whose offset is
+     * aligned to that same size. For arity 4 over a 2 GiB protected range
+     * that is 16 KiB, 64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB, 64 MiB,
+     * 256 MiB and 1 GiB, each aligned to itself.
      *
      * Requires init()'s protectedOsRange to be established. Kept separate
      * from init() so a future runtime writer of the held-region state can

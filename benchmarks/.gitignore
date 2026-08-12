@@ -13,3 +13,7 @@ blob.bin
 blob_bytes.h
 blob_xtea.bin
 blob_xtea_bytes.h
+cache_probe
+graph_walk_host
+blob_walk.bin
+blob_walk_bytes.h

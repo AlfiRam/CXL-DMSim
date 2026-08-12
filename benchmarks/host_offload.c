@@ -38,11 +38,13 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "cxl_mailbox.h"
@@ -72,9 +74,64 @@
 #define XP0 0xDEADBEEFu
 #define XP1 0xCAFEF00Du
 
-/* Poll budget: POLL_TRIES * POLL_SLEEP_US microseconds of simulated time. */
-#define POLL_TRIES     100000
+/* Poll budget, expressed as SIMULATED TIME rather than as an iteration
+ * count: at the historical 100,000 tries x 1000 us the budget was 100 s
+ * only because the period was 1 ms -- under MB_POLL_US=0 (busy-spin) the
+ * same 100,000 iterations collapse to ~30 ms and a long task reports a
+ * spurious TIMEOUT. MB_TIMEOUT_S in the environment overrides.
+ *
+ * How the bound is applied, and why it differs by mode:
+ *   - sleeping (g_poll_us > 0): the budget converts to an exact
+ *     iteration count BEFORE the loop, so the loop body is untouched
+ *     and adds no clock calls. At the default period this is exactly
+ *     100,000 tries -- historical behaviour, bit for bit.
+ *   - busy-spin (g_poll_us == 0): per-iteration cost is unknowable
+ *     ahead of time (it is one UC round trip), so the deadline is
+ *     checked against the guest clock every SPIN_CHECK iterations.
+ *     Not every iteration: the clock call would otherwise dominate a
+ *     spin loop. Residual overshoot is bounded by SPIN_CHECK
+ *     iterations plus the guest clock's ~1 ms jiffy granularity.
+ */
+#define POLL_TRIES     100000          /* historical, default period */
 #define POLL_SLEEP_US  1000
+#define POLL_TIMEOUT_S 100             /* == POLL_TRIES * POLL_SLEEP_US */
+#define SPIN_CHECK     256             /* power of two; see mask below */
+
+static long g_timeout_s = POLL_TIMEOUT_S;
+
+/* Runtime poll period, so the baseline can be swept rather than
+ * asserted: MB_POLL_US in the environment overrides POLL_SLEEP_US
+ * (threaded from the f2 config's --poll-us). 0 means busy-spin --
+ * note usleep(0) still syscalls, hence the explicit branch at the
+ * call site. */
+static long g_poll_us = POLL_SLEEP_US;
+
+static uint64_t
+now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* Iteration cap implementing the time budget. Sleeping: exact
+ * conversion, no clock calls in the loop. Busy-spin: uncapped here, the
+ * deadline below bounds it. */
+static long
+poll_tries(void)
+{
+    if (g_poll_us <= 0)
+        return LONG_MAX;
+    return (long)(((uint64_t)g_timeout_s * 1000000ULL) /
+                  (uint64_t)g_poll_us);
+}
+
+/* Absolute deadline, consulted only on the busy-spin path. */
+static uint64_t
+poll_deadline(void)
+{
+    return now_ns() + (uint64_t)g_timeout_s * 1000000000ULL;
+}
 
 static uint32_t read_status(volatile struct cxl_mailbox *mb)
 {
@@ -128,8 +185,24 @@ int main(int argc, char **argv)
                        : is_handoff ? "OP_HANDOFF"
                                 : "OP_EXEC_BLOB/xtea";
 
+    /* Poll period: environment override, 0 = busy-spin. */
+    const char *poll_env = getenv("MB_POLL_US");
+    if (poll_env)
+        g_poll_us = atol(poll_env);
+    if (g_poll_us < 0)
+        g_poll_us = POLL_SLEEP_US;
+    const char *to_env = getenv("MB_TIMEOUT_S");
+    if (to_env)
+        g_timeout_s = atol(to_env);
+    if (g_timeout_s <= 0)
+        g_timeout_s = POLL_TIMEOUT_S;
+
     printf("=== host_offload: CXL mailbox dispatch (producer) [%s] ===\n",
            opname);
+    printf("[host] poll timeout: %ld s (time-equivalent budget)\n",
+           g_timeout_s);
+    printf("[host] poll period: %ld us%s\n",
+           g_poll_us, g_poll_us == 0 ? " (busy-spin)" : "");
 
     int fd = open("/dev/mem", O_RDWR | O_SYNC);
     if (fd < 0) {
@@ -333,13 +406,18 @@ int main(int argc, char **argv)
     /* ---- Poll for completion ---- */
     uint32_t st = STATUS_IDLE;
     int done = 0;
-    for (long t = 0; t < POLL_TRIES; t++) {
+    long tries = poll_tries();
+    uint64_t deadline = poll_deadline();
+    for (long t = 0; t < tries; t++) {
         st = read_status(mb);
         if (st == STATUS_DONE || st == STATUS_ERROR) {
             done = 1;
             break;
         }
-        usleep(POLL_SLEEP_US);
+        if (g_poll_us > 0)
+            usleep(g_poll_us);
+        else if ((t & (SPIN_CHECK - 1)) == 0 && now_ns() >= deadline)
+            break;
     }
 
     if (!done) {
